@@ -146,3 +146,59 @@ baseline_write() {
     mkdir -p "$(dirname "$baseline_file")"
     cp "$candidates_file" "$baseline_file"
 }
+
+send_slack_alert() {
+    local message="$1"
+    local webhook_url="$2"
+    [ -z "$webhook_url" ] && { echo "ERRORE: webhook Slack non configurato"; return 1; }
+
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
+        --data "$(jq -n --arg text "$message" '{text: $text}')" \
+        "$webhook_url")
+
+    if [ "$http_code" != "200" ]; then
+        echo "ERRORE: invio Slack fallito, HTTP $http_code"
+        return 1
+    fi
+    return 0
+}
+
+should_notify() {
+    local anomaly_id="$1"
+    local state_file="$2"
+    local reminder_interval="$3"
+    local now="$4"
+
+    mkdir -p "$(dirname "$state_file")" 2>/dev/null || true
+    touch "$state_file"
+
+    local line last_notified first_seen
+    line=$(grep -F "${anomaly_id}"$'\t' "$state_file" || true)
+    if [ -z "$line" ]; then
+        echo -e "${anomaly_id}\t${now}\t${now}" >> "$state_file"
+        return 0
+    fi
+
+    first_seen=$(echo "$line" | cut -f2)
+    last_notified=$(echo "$line" | cut -f3)
+    if [ $((now - last_notified)) -ge "$reminder_interval" ]; then
+        local tmp_state
+        tmp_state=$(mktemp)
+        grep -vF "${anomaly_id}"$'\t' "$state_file" > "$tmp_state" || true
+        echo -e "${anomaly_id}\t${first_seen}\t${now}" >> "$tmp_state"
+        mv "$tmp_state" "$state_file"
+        return 0
+    fi
+    return 1
+}
+
+clear_resolved() {
+    local anomaly_id="$1"
+    local state_file="$2"
+    [ -f "$state_file" ] || return 0
+    local tmp_state
+    tmp_state=$(mktemp)
+    grep -vF "${anomaly_id}"$'\t' "$state_file" > "$tmp_state" || true
+    mv "$tmp_state" "$state_file"
+}
