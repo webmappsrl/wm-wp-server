@@ -414,6 +414,25 @@ test_with_lock_runs_and_releases_when_free() {
     rm -rf "$tmp"
 }
 
+test_run_check_forwards_stdout_with_nonzero_return() {
+    fake_check_violation() {
+        echo "VIOLAZIONE: qualcosa non va"
+        return 1
+    }
+    local out
+    out=$(run_check "fake-check" fake_check_violation)
+    assert_eq "run_check inoltra stdout anche con return non-zero" "VIOLAZIONE: qualcosa non va" "$out"
+}
+
+test_run_check_empty_output_with_zero_return() {
+    fake_check_clean() {
+        return 0
+    }
+    local out
+    out=$(run_check "fake-check-clean" fake_check_clean)
+    assert_eq "run_check non produce output per check pulito (return 0, no stdout)" "" "$out"
+}
+
 test_enumerate_sites_finds_two_distinct_docroots
 test_enumerate_sites_empty_dir_returns_zero
 test_enumerate_sites_multi_space_and_tabs
@@ -443,5 +462,7 @@ test_should_notify_true_after_reminder_interval
 test_clear_resolved_removes_entry
 test_with_lock_prevents_concurrent_execution
 test_with_lock_runs_and_releases_when_free
+test_run_check_forwards_stdout_with_nonzero_return
+test_run_check_empty_output_with_zero_return
 
 exit $FAIL
