@@ -215,6 +215,84 @@ test_check_htaccess_detects_php_content() {
     rm -rf "$tmp"
 }
 
+test_check_index_integrity_flags_core_mismatch() {
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/wp-admin"
+    printf '<?php /* modificato da un attacco */ ?>' > "$tmp/wp-admin/index.php"
+    local checksums_json='{"checksums":{"wp-admin/index.php":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+    local out count
+    out=$(check_index_integrity "$tmp" "$checksums_json" "/dev/null")
+    count=$(echo "$out" | grep -c "ANOMALIA" || true)
+    assert_eq "rileva index.php core che non combacia col checksum ufficiale" "1" "$count"
+    rm -rf "$tmp"
+}
+
+test_check_index_integrity_passes_core_match() {
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/wp-admin"
+    printf 'contenuto-originale' > "$tmp/wp-admin/index.php"
+    local real_md5 checksums_json out count
+    real_md5=$(md5sum "$tmp/wp-admin/index.php" | cut -d' ' -f1)
+    checksums_json="{\"checksums\":{\"wp-admin/index.php\":\"$real_md5\"}}"
+    out=$(check_index_integrity "$tmp" "$checksums_json" "/dev/null")
+    count=$(echo "$out" | wc -l | tr -d ' ')
+    [ -z "$out" ] && count=0
+    assert_eq "nessuna anomalia quando l'hash combacia col core" "0" "$count"
+    rm -rf "$tmp"
+}
+
+test_check_index_integrity_recognizes_boilerplate() {
+    local tmp boilerplate
+    tmp=$(mktemp -d)
+    boilerplate=$(mktemp)
+    printf '<?php\n// Silence is golden.\n' > "$tmp/index.php"
+    md5sum "$tmp/index.php" | cut -d' ' -f1 > "$boilerplate"
+    local checksums_json='{"checksums":{}}'
+    local out
+    out=$(check_index_integrity "$tmp" "$checksums_json" "$boilerplate")
+    assert_eq "boilerplate nota non genera output" "" "$out"
+    rm -rf "$tmp" "$boilerplate"
+}
+
+test_check_index_integrity_flags_unrecognized_file() {
+    local tmp
+    tmp=$(mktemp -d)
+    printf '<?php echo "contenuto mai visto prima"; ?>' > "$tmp/index.php"
+    local checksums_json='{"checksums":{}}'
+    local out count
+    out=$(check_index_integrity "$tmp" "$checksums_json" "/dev/null")
+    count=$(echo "$out" | grep -c "DA_RIVEDERE" || true)
+    assert_eq "segnala per revisione un file non riconosciuto" "1" "$count"
+    rm -rf "$tmp"
+}
+
+test_baseline_diff_shows_new_files_when_no_baseline_exists() {
+    local tmp candidates
+    tmp=$(mktemp -d)
+    candidates="$tmp/candidates.tsv"
+    printf 'index.php\tabc123\n' > "$candidates"
+    local out count
+    out=$(baseline_diff "$candidates" "$tmp/nonexistent-baseline.tsv")
+    count=$(echo "$out" | grep -c "abc123" || true)
+    assert_eq "mostra i candidati come nuovi quando non c'è baseline" "1" "$count"
+    rm -rf "$tmp"
+}
+
+test_baseline_write_persists_candidates() {
+    local tmp candidates baseline
+    tmp=$(mktemp -d)
+    candidates="$tmp/candidates.tsv"
+    baseline="$tmp/baseline.tsv"
+    printf 'index.php\tabc123\n' > "$candidates"
+    baseline_write "$candidates" "$baseline"
+    local content
+    content=$(cat "$baseline")
+    assert_eq "la baseline scritta corrisponde ai candidati" "$(cat "$candidates")" "$content"
+    rm -rf "$tmp"
+}
+
 test_enumerate_sites_finds_two_distinct_docroots
 test_enumerate_sites_empty_dir_returns_zero
 test_enumerate_sites_multi_space_and_tabs
@@ -228,5 +306,11 @@ test_check_ioc_files_detects_php_in_image_extension
 test_check_ioc_files_detects_php_tag_not_at_start
 test_check_htaccess_detects_known_signature
 test_check_htaccess_detects_php_content
+test_check_index_integrity_flags_core_mismatch
+test_check_index_integrity_passes_core_match
+test_check_index_integrity_recognizes_boilerplate
+test_check_index_integrity_flags_unrecognized_file
+test_baseline_diff_shows_new_files_when_no_baseline_exists
+test_baseline_write_persists_candidates
 
 exit $FAIL

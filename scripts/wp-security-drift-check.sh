@@ -94,3 +94,55 @@ check_htaccess() {
         fi
     done < <(find "$docroot" -type f -name ".htaccess" -print0 2>/dev/null)
 }
+
+get_wp_version() {
+    local docroot="$1"
+    grep -oP '(?<=\$wp_version = '"'"')[^'"'"']+' "$docroot/wp-includes/version.php" 2>/dev/null
+}
+
+fetch_core_checksums() {
+    local version="$1"
+    curl -s "https://api.wordpress.org/core/checksums/1.0/?version=${version}&locale=en_US"
+}
+
+check_index_integrity() {
+    local docroot="$1"
+    local checksums_json="$2"
+    local boilerplate_file="$3"
+    local f relpath md5 corehash
+
+    while IFS= read -r -d '' f; do
+        relpath="${f#$docroot/}"
+        md5=$(md5sum "$f" | cut -d' ' -f1)
+
+        corehash=$(echo "$checksums_json" | jq -r --arg p "$relpath" '.checksums[$p] // empty' 2>/dev/null)
+        if [ -n "$corehash" ]; then
+            [ "$md5" = "$corehash" ] && continue
+            echo "ANOMALIA: $f non combacia col checksum core WordPress ($relpath)"
+            continue
+        fi
+
+        if [ -f "$boilerplate_file" ] && grep -qxF "$md5" "$boilerplate_file"; then
+            continue
+        fi
+
+        echo "DA_RIVEDERE: $f non riconosciuto (né core né boilerplate nota)"
+    done < <(find "$docroot" -type f -name "index.php" -print0 2>/dev/null)
+}
+
+baseline_diff() {
+    local candidates_file="$1"
+    local baseline_file="$2"
+    if [ -f "$baseline_file" ]; then
+        diff "$baseline_file" "$candidates_file" || true
+    else
+        cat "$candidates_file"
+    fi
+}
+
+baseline_write() {
+    local candidates_file="$1"
+    local baseline_file="$2"
+    mkdir -p "$(dirname "$baseline_file")"
+    cp "$candidates_file" "$baseline_file"
+}
