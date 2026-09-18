@@ -164,6 +164,57 @@ test_is_exception_matches_listed_domain() {
     rm -rf "$tmp"
 }
 
+test_check_ioc_files_detects_php_in_image_extension() {
+    local tmp
+    tmp=$(mktemp -d)
+    printf '<?php system($_GET["c"]); ?>' > "$tmp/logo.png"
+    printf '\x89PNG\x0d\x0a\x1a\x0a real image bytes' > "$tmp/clean.png"
+    local out count
+    out=$(check_ioc_files "$tmp")
+    count=$(echo "$out" | grep -c "logo.png" || true)
+    assert_eq "rileva PHP embedded in file .png" "1" "$count"
+    count=$(echo "$out" | grep -c "clean.png" || true)
+    assert_eq "non segnala un'immagine pulita" "0" "$count"
+    rm -rf "$tmp"
+}
+
+test_check_ioc_files_detects_php_tag_not_at_start() {
+    local tmp
+    tmp=$(mktemp -d)
+    printf 'GIF89a-fake-header-bytes-then <?= system($_GET["c"]); ?>' > "$tmp/anim.gif"
+    local out count
+    out=$(check_ioc_files "$tmp")
+    count=$(echo "$out" | grep -c "anim.gif" || true)
+    assert_eq "rileva <?= anche non all'inizio del file" "1" "$count"
+    rm -rf "$tmp"
+}
+
+test_check_htaccess_detects_known_signature() {
+    local tmp
+    tmp=$(mktemp -d)
+    printf '%s' "$(head -c 32 /dev/zero | tr '\0' 'x')" > "$tmp/.htaccess"
+    # forza il contenuto esatto la cui firma md5 conosciamo
+    printf 'contenuto-malevolo-noto-oc8547' > "$tmp/.htaccess"
+    local known_md5
+    known_md5=$(md5sum "$tmp/.htaccess" | cut -d' ' -f1)
+    local out count
+    out=$(HTACCESS_KNOWN_BAD_MD5="$known_md5" check_htaccess "$tmp")
+    count=$(echo "$out" | grep -c "firma nota" || true)
+    assert_eq "rileva .htaccess con firma md5 nota" "1" "$count"
+    rm -rf "$tmp"
+}
+
+test_check_htaccess_detects_php_content() {
+    local tmp
+    tmp=$(mktemp -d)
+    printf 'RewriteEngine On\n<?php eval($_POST["x"]); ?>\n' > "$tmp/.htaccess"
+    local out count
+    out=$(check_htaccess "$tmp")
+    count=$(echo "$out" | grep -c "sospetto" || true)
+    assert_eq "rileva .htaccess con contenuto PHP" "1" "$count"
+    rm -rf "$tmp"
+}
+
 test_enumerate_sites_finds_two_distinct_docroots
 test_enumerate_sites_empty_dir_returns_zero
 test_enumerate_sites_multi_space_and_tabs
@@ -173,5 +224,9 @@ test_check_wp_config_flags_detects_violation
 test_check_wp_config_flags_passes_when_both_true
 test_check_wp_config_flags_skips_non_wordpress
 test_is_exception_matches_listed_domain
+test_check_ioc_files_detects_php_in_image_extension
+test_check_ioc_files_detects_php_tag_not_at_start
+test_check_htaccess_detects_known_signature
+test_check_htaccess_detects_php_content
 
 exit $FAIL
