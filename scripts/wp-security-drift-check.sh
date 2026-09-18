@@ -202,3 +202,102 @@ clear_resolved() {
     grep -vF "${anomaly_id}"$'\t' "$state_file" > "$tmp_state" || true
     mv "$tmp_state" "$state_file"
 }
+
+with_lock() {
+    local lockfile="$1"; shift
+    local fn="$1"; shift
+    if [ -e "$lockfile" ]; then
+        return 1
+    fi
+    touch "$lockfile"
+    "$fn" "$@"
+    local rc=$?
+    rm -f "$lockfile"
+    return $rc
+}
+
+LOCKFILE="${LOCKFILE:-/tmp/wp-security-drift-check.lock}"
+LOG_FILE="${LOG_FILE:-/var/log/wp-security-drift-check.log}"
+STATE_FILE="${STATE_FILE:-/root/state/wp-security-drift-state.tsv}"
+BASELINE_FILE="${BASELINE_FILE:-/root/state/wp-security-index-baseline.tsv}"
+HEARTBEAT_FILE="${HEARTBEAT_FILE:-/root/state/wp-security-drift-heartbeat}"
+EXCEPTIONS_FILE="${EXCEPTIONS_FILE:-/root/config/disallow-exceptions.conf}"
+BOILERPLATE_FILE="${BOILERPLATE_FILE:-/root/config/index-boilerplate-whitelist.txt}"
+NO_PHP_CONF="${NO_PHP_CONF:-/etc/apache2/conf-available/no-php-in-writable.conf}"
+SLACK_WEBHOOK_URL_FILE="${SLACK_WEBHOOK_URL_FILE:-/root/.wp-security-slack-webhook}"
+REMINDER_INTERVAL_SECONDS="${REMINDER_INTERVAL_SECONDS:-21600}"
+
+log() {
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    echo "$(date '+%F %T') - $1" >> "$LOG_FILE"
+}
+
+run_check() {
+    local name="$1"; shift
+    local output
+    if ! output=$("$@" 2>&1); then
+        log "ERRORE nel check '$name': $output"
+        return
+    fi
+    if [ -n "$output" ]; then
+        echo "$output"
+    fi
+}
+
+main() {
+    local sites site_count anomalies=()
+
+    sites=$(enumerate_sites)
+    site_count=$(count_sites "$sites")
+
+    if [ "$site_count" -lt 1 ]; then
+        anomalies+=("[enumerazione] 0 siti trovati — possibile bug nel parsing dei vhost, nessun controllo eseguito")
+    fi
+
+    local domain docroot
+    while IFS='|' read -r domain docroot; do
+        [ -z "$docroot" ] && continue
+        is_exception "$domain" "$EXCEPTIONS_FILE" && continue
+
+        local out
+        out=$(run_check "apache-rule" check_apache_protection_enabled "$NO_PHP_CONF")
+        [ -n "$out" ] && anomalies+=("[$domain] $out")
+
+        out=$(run_check "wp-config" check_wp_config_flags "$docroot")
+        [ -n "$out" ] && anomalies+=("[$domain] $out")
+
+        out=$(run_check "ioc-files" check_ioc_files "$docroot")
+        [ -n "$out" ] && anomalies+=("[$domain] $out")
+
+        out=$(run_check "htaccess" check_htaccess "$docroot")
+        [ -n "$out" ] && anomalies+=("[$domain] $out")
+
+        local wp_version checksums_json
+        wp_version=$(get_wp_version "$docroot")
+        if [ -n "$wp_version" ]; then
+            checksums_json=$(fetch_core_checksums "$wp_version")
+            out=$(run_check "index-integrity" check_index_integrity "$docroot" "$checksums_json" "$BOILERPLATE_FILE")
+            [ -n "$out" ] && anomalies+=("[$domain] $out")
+        fi
+    done <<< "$sites"
+
+    local webhook_url=""
+    [ -f "$SLACK_WEBHOOK_URL_FILE" ] && webhook_url=$(cat "$SLACK_WEBHOOK_URL_FILE")
+
+    local anomaly anomaly_id now
+    now=$(date +%s)
+    for anomaly in "${anomalies[@]}"; do
+        anomaly_id=$(echo "$anomaly" | md5sum | cut -d' ' -f1)
+        log "$anomaly"
+        if should_notify "$anomaly_id" "$STATE_FILE" "$REMINDER_INTERVAL_SECONDS" "$now"; then
+            send_slack_alert "$anomaly" "$webhook_url" || log "invio Slack fallito per: $anomaly"
+        fi
+    done
+
+    mkdir -p "$(dirname "$HEARTBEAT_FILE")" 2>/dev/null || true
+    date +%s > "$HEARTBEAT_FILE"
+}
+
+if [[ "${1:-}" != "--source-only" ]]; then
+    with_lock "$LOCKFILE" main
+fi
