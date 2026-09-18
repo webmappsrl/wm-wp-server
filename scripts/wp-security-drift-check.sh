@@ -242,13 +242,16 @@ run_check() {
 }
 
 main() {
-    local sites site_count anomalies=()
+    local sites site_count
+    local anomaly_domains=() anomaly_checks=() anomaly_details=()
 
     sites=$(enumerate_sites)
     site_count=$(count_sites "$sites")
 
     if [ "$site_count" -lt 1 ]; then
-        anomalies+=("[enumerazione] 0 siti trovati — possibile bug nel parsing dei vhost, nessun controllo eseguito")
+        anomaly_domains+=("enumerazione")
+        anomaly_checks+=("enumerazione-siti")
+        anomaly_details+=("0 siti trovati — possibile bug nel parsing dei vhost, nessun controllo eseguito")
     fi
 
     local domain docroot
@@ -258,39 +261,64 @@ main() {
 
         local out
         out=$(run_check "apache-rule" check_apache_protection_enabled "$NO_PHP_CONF")
-        [ -n "$out" ] && anomalies+=("[$domain] $out")
+        if [ -n "$out" ]; then
+            anomaly_domains+=("$domain"); anomaly_checks+=("apache-rule"); anomaly_details+=("$out")
+        fi
 
         out=$(run_check "wp-config" check_wp_config_flags "$docroot")
-        [ -n "$out" ] && anomalies+=("[$domain] $out")
+        if [ -n "$out" ]; then
+            anomaly_domains+=("$domain"); anomaly_checks+=("wp-config"); anomaly_details+=("$out")
+        fi
 
         out=$(run_check "ioc-files" check_ioc_files "$docroot")
-        [ -n "$out" ] && anomalies+=("[$domain] $out")
+        if [ -n "$out" ]; then
+            anomaly_domains+=("$domain"); anomaly_checks+=("ioc-files"); anomaly_details+=("$out")
+        fi
 
         out=$(run_check "htaccess" check_htaccess "$docroot")
-        [ -n "$out" ] && anomalies+=("[$domain] $out")
+        if [ -n "$out" ]; then
+            anomaly_domains+=("$domain"); anomaly_checks+=("htaccess"); anomaly_details+=("$out")
+        fi
 
         out=$(run_check "uploads-php" check_unexpected_php_in_uploads "$docroot")
-        [ -n "$out" ] && anomalies+=("[$domain] $out")
+        if [ -n "$out" ]; then
+            anomaly_domains+=("$domain"); anomaly_checks+=("uploads-php"); anomaly_details+=("$out")
+        fi
 
         local wp_version checksums_json
         wp_version=$(get_wp_version "$docroot")
         if [ -n "$wp_version" ]; then
             checksums_json=$(fetch_core_checksums "$wp_version")
             out=$(run_check "index-integrity" check_index_integrity "$docroot" "$checksums_json" "$BOILERPLATE_FILE")
-            [ -n "$out" ] && anomalies+=("[$domain] $out")
+            if [ -n "$out" ]; then
+                anomaly_domains+=("$domain"); anomaly_checks+=("index-integrity"); anomaly_details+=("$out")
+            fi
         fi
     done <<< "$sites"
 
     local webhook_url=""
     [ -f "$SLACK_WEBHOOK_URL_FILE" ] && webhook_url=$(cat "$SLACK_WEBHOOK_URL_FILE")
 
-    local anomaly anomaly_id now
+    local i anomaly_domain anomaly_check anomaly_detail anomaly_id anomaly_count log_line slack_message now
     now=$(date +%s)
-    for anomaly in "${anomalies[@]}"; do
-        anomaly_id=$(echo "$anomaly" | md5sum | cut -d' ' -f1)
-        log "$anomaly"
+    for i in "${!anomaly_domains[@]}"; do
+        anomaly_domain="${anomaly_domains[$i]}"
+        anomaly_check="${anomaly_checks[$i]}"
+        anomaly_detail="${anomaly_details[$i]}"
+
+        # Il log riceve il dettaglio completo (tutti i path); Slack riceve solo il conteggio.
+        log_line="[$anomaly_domain] $anomaly_check: $anomaly_detail"
+        anomaly_count=$(printf '%s\n' "$anomaly_detail" | grep -c .)
+
+        # L'anomaly_id NON dipende dal contenuto (i path possono cambiare run dopo run):
+        # dipende solo da sito+tipo di check, così should_notify throttling non riparte da zero
+        # ogni volta che cambia anche di un solo file l'elenco delle anomalie rilevate.
+        anomaly_id="${anomaly_domain}:${anomaly_check}"
+
+        log "$log_line"
         if should_notify "$anomaly_id" "$STATE_FILE" "$REMINDER_INTERVAL_SECONDS" "$now"; then
-            send_slack_alert "$anomaly" "$webhook_url" || log "invio Slack fallito per: $anomaly"
+            slack_message="[$anomaly_domain] ${anomaly_check}: ${anomaly_count} anomalie rilevate — vedi log su wordpress-php8:/var/log/wp-security-drift-check.log"
+            send_slack_alert "$slack_message" "$webhook_url" || log "invio Slack fallito per: $log_line"
         fi
     done
 
