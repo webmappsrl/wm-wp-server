@@ -388,6 +388,32 @@ test_clear_resolved_removes_entry() {
     rm -rf "$tmp"
 }
 
+test_with_lock_prevents_concurrent_execution() {
+    local tmp lockfile
+    tmp=$(mktemp -d)
+    lockfile="$tmp/test.lock"
+    touch "$lockfile"
+
+    noop() { echo "eseguito"; }
+    local out rc=0
+    out=$(with_lock "$lockfile" noop) || rc=$?
+    assert_eq "with_lock non esegue se il lock è già preso" "1" "$rc"
+    rm -rf "$tmp"
+}
+
+test_with_lock_runs_and_releases_when_free() {
+    local tmp lockfile
+    tmp=$(mktemp -d)
+    lockfile="$tmp/test.lock"
+
+    noop() { echo "eseguito"; }
+    local out
+    out=$(with_lock "$lockfile" noop)
+    assert_eq "with_lock esegue la funzione quando libero" "eseguito" "$out"
+    assert_eq "il lock viene rilasciato dopo l'esecuzione" "false" "$([ -e "$lockfile" ] && echo true || echo false)"
+    rm -rf "$tmp"
+}
+
 test_enumerate_sites_finds_two_distinct_docroots
 test_enumerate_sites_empty_dir_returns_zero
 test_enumerate_sites_multi_space_and_tabs
@@ -415,5 +441,7 @@ test_should_notify_true_for_new_anomaly
 test_should_notify_false_before_reminder_interval
 test_should_notify_true_after_reminder_interval
 test_clear_resolved_removes_entry
+test_with_lock_prevents_concurrent_execution
+test_with_lock_runs_and_releases_when_free
 
 exit $FAIL
