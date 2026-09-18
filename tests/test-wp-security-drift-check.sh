@@ -283,6 +283,39 @@ test_check_unexpected_php_in_uploads_skips_whitelisted_index() {
     rm -rf "$tmp" "$boilerplate"
 }
 
+test_check_unexpected_php_in_uploads_skips_nested_sucuri() {
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/wp-content/uploads/sites/2/sucuri"
+    printf '<?php // nested sucuri datastore ?>' > "$tmp/wp-content/uploads/sites/2/sucuri/datastore.php"
+    local out
+    out=$(BOILERPLATE_FILE=/dev/null check_unexpected_php_in_uploads "$tmp")
+    assert_eq "non segnala file in sucuri/ anche se annidato (multisite)" "" "$out"
+    rm -rf "$tmp"
+}
+
+test_check_unexpected_php_in_uploads_skips_nested_wpforms_cache() {
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/wp-content/uploads/sites/2/wpforms/cache"
+    printf '<?php // wpforms cache ?>' > "$tmp/wp-content/uploads/sites/2/wpforms/cache/form123.php"
+    local out
+    out=$(BOILERPLATE_FILE=/dev/null check_unexpected_php_in_uploads "$tmp")
+    assert_eq "non segnala file in wpforms/cache/ anche se annidato" "" "$out"
+    rm -rf "$tmp"
+}
+
+test_check_unexpected_php_in_uploads_skips_debug_log_php_with_mailchimp_pattern() {
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/wp-content/uploads"
+    printf '<?php exit;' > "$tmp/wp-content/uploads/debug-log.php"
+    local out
+    out=$(BOILERPLATE_FILE=/dev/null check_unexpected_php_in_uploads "$tmp")
+    assert_eq "non segnala debug-log.php con pattern Mailchimp" "" "$out"
+    rm -rf "$tmp"
+}
+
 test_check_index_integrity_flags_core_mismatch() {
     local tmp
     tmp=$(mktemp -d)
@@ -520,6 +553,9 @@ test_check_unexpected_php_in_uploads_skips_sucuri
 test_check_unexpected_php_in_uploads_skips_charmap
 test_check_unexpected_php_in_uploads_missing_uploads_dir
 test_check_unexpected_php_in_uploads_skips_whitelisted_index
+test_check_unexpected_php_in_uploads_skips_nested_sucuri
+test_check_unexpected_php_in_uploads_skips_nested_wpforms_cache
+test_check_unexpected_php_in_uploads_skips_debug_log_php_with_mailchimp_pattern
 test_check_index_integrity_flags_core_mismatch
 test_check_index_integrity_passes_core_match
 test_check_index_integrity_recognizes_boilerplate
