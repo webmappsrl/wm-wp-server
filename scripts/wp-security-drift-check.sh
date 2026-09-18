@@ -310,10 +310,10 @@ check_unexpected_php_in_uploads() {
         relpath="${f#$uploads_dir/}"
         base="$(basename "$f")"
 
-        case "$relpath" in
-            cache/wpml/twig/*) continue ;;
-            sucuri/*) continue ;;
-            wpforms/cache/*) continue ;;
+        case "/$relpath" in
+            */cache/wpml/twig/*) continue ;;
+            */sucuri/*) continue ;;
+            */wpforms/cache/*) continue ;;
         esac
 
         case "$base" in
