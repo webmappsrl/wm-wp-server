@@ -167,30 +167,17 @@ send_slack_alert() {
 should_notify() {
     local anomaly_id="$1"
     local state_file="$2"
-    local reminder_interval="$3"
-    local now="$4"
 
     mkdir -p "$(dirname "$state_file")" 2>/dev/null || true
     touch "$state_file"
 
-    local line last_notified first_seen
-    line=$(grep -F "${anomaly_id}"$'\t' "$state_file" || true)
-    if [ -z "$line" ]; then
-        echo -e "${anomaly_id}\t${now}\t${now}" >> "$state_file"
-        return 0
+    if grep -qF "${anomaly_id}"$'\t' "$state_file" 2>/dev/null; then
+        # Già presente nello stato: già notificata una volta, resta aperta. Niente reminder.
+        return 1
     fi
 
-    first_seen=$(echo "$line" | cut -f2)
-    last_notified=$(echo "$line" | cut -f3)
-    if [ $((now - last_notified)) -ge "$reminder_interval" ]; then
-        local tmp_state
-        tmp_state=$(mktemp)
-        grep -vF "${anomaly_id}"$'\t' "$state_file" > "$tmp_state" || true
-        echo -e "${anomaly_id}\t${first_seen}\t${now}" >> "$tmp_state"
-        mv "$tmp_state" "$state_file"
-        return 0
-    fi
-    return 1
+    echo -e "${anomaly_id}\tnotificata" >> "$state_file"
+    return 0
 }
 
 clear_resolved() {
@@ -225,7 +212,6 @@ EXCEPTIONS_FILE="${EXCEPTIONS_FILE:-/root/config/disallow-exceptions.conf}"
 BOILERPLATE_FILE="${BOILERPLATE_FILE:-/root/config/index-boilerplate-whitelist.txt}"
 NO_PHP_CONF="${NO_PHP_CONF:-/etc/apache2/conf-available/no-php-in-writable.conf}"
 SLACK_WEBHOOK_URL_FILE="${SLACK_WEBHOOK_URL_FILE:-/root/.wp-security-slack-webhook}"
-REMINDER_INTERVAL_SECONDS="${REMINDER_INTERVAL_SECONDS:-21600}"
 
 log() {
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
@@ -263,26 +249,36 @@ main() {
         out=$(run_check "apache-rule" check_apache_protection_enabled "$NO_PHP_CONF")
         if [ -n "$out" ]; then
             anomaly_domains+=("$domain"); anomaly_checks+=("apache-rule"); anomaly_details+=("$out")
+        else
+            clear_resolved "$domain:apache-rule" "$STATE_FILE"
         fi
 
         out=$(run_check "wp-config" check_wp_config_flags "$docroot")
         if [ -n "$out" ]; then
             anomaly_domains+=("$domain"); anomaly_checks+=("wp-config"); anomaly_details+=("$out")
+        else
+            clear_resolved "$domain:wp-config" "$STATE_FILE"
         fi
 
         out=$(run_check "ioc-files" check_ioc_files "$docroot")
         if [ -n "$out" ]; then
             anomaly_domains+=("$domain"); anomaly_checks+=("ioc-files"); anomaly_details+=("$out")
+        else
+            clear_resolved "$domain:ioc-files" "$STATE_FILE"
         fi
 
         out=$(run_check "htaccess" check_htaccess "$docroot")
         if [ -n "$out" ]; then
             anomaly_domains+=("$domain"); anomaly_checks+=("htaccess"); anomaly_details+=("$out")
+        else
+            clear_resolved "$domain:htaccess" "$STATE_FILE"
         fi
 
         out=$(run_check "uploads-php" check_unexpected_php_in_uploads "$docroot")
         if [ -n "$out" ]; then
             anomaly_domains+=("$domain"); anomaly_checks+=("uploads-php"); anomaly_details+=("$out")
+        else
+            clear_resolved "$domain:uploads-php" "$STATE_FILE"
         fi
 
         local wp_version checksums_json
@@ -292,15 +288,20 @@ main() {
             out=$(run_check "index-integrity" check_index_integrity "$docroot" "$checksums_json" "$BOILERPLATE_FILE")
             if [ -n "$out" ]; then
                 anomaly_domains+=("$domain"); anomaly_checks+=("index-integrity"); anomaly_details+=("$out")
+            else
+                # Check eseguito davvero e risultato pulito: possiamo pulire un'anomalia precedente.
+                clear_resolved "$domain:index-integrity" "$STATE_FILE"
             fi
         fi
+        # Se wp_version non è determinabile, il check non è stato eseguito: non tocchiamo
+        # lo stato di index-integrity, perché l'assenza di esecuzione non dice nulla sulla
+        # risoluzione di un'anomalia precedente.
     done <<< "$sites"
 
     local webhook_url=""
     [ -f "$SLACK_WEBHOOK_URL_FILE" ] && webhook_url=$(cat "$SLACK_WEBHOOK_URL_FILE")
 
-    local i anomaly_domain anomaly_check anomaly_detail anomaly_id anomaly_count log_line slack_message now
-    now=$(date +%s)
+    local i anomaly_domain anomaly_check anomaly_detail anomaly_id anomaly_count log_line slack_message
     for i in "${!anomaly_domains[@]}"; do
         anomaly_domain="${anomaly_domains[$i]}"
         anomaly_check="${anomaly_checks[$i]}"
@@ -311,12 +312,12 @@ main() {
         anomaly_count=$(printf '%s\n' "$anomaly_detail" | grep -c .)
 
         # L'anomaly_id NON dipende dal contenuto (i path possono cambiare run dopo run):
-        # dipende solo da sito+tipo di check, così should_notify throttling non riparte da zero
-        # ogni volta che cambia anche di un solo file l'elenco delle anomalie rilevate.
+        # dipende solo da sito+tipo di check, così should_notify/clear_resolved tracciano lo
+        # stesso stato anche se cambia il singolo file nell'elenco delle anomalie rilevate.
         anomaly_id="${anomaly_domain}:${anomaly_check}"
 
         log "$log_line"
-        if should_notify "$anomaly_id" "$STATE_FILE" "$REMINDER_INTERVAL_SECONDS" "$now"; then
+        if should_notify "$anomaly_id" "$STATE_FILE"; then
             slack_message="[$anomaly_domain] ${anomaly_check}: ${anomaly_count} anomalie rilevate — vedi log su wordpress-php8:/var/log/wp-security-drift-check.log"
             send_slack_alert "$slack_message" "$webhook_url" || log "invio Slack fallito per: $log_line"
         fi
