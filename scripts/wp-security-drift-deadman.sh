@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # wp-security-drift-deadman.sh
-# Dead-man's-switch indipendente da Slack — oc:8558
+# Dead-man's-switch — segnala su Slack se lo script principale si ferma — oc:8558
 set -uo pipefail
 
 HEARTBEAT_FILE="${HEARTBEAT_FILE:-/root/state/wp-security-drift-heartbeat}"
