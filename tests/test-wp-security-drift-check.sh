@@ -450,30 +450,21 @@ test_should_notify_true_for_new_anomaly() {
     tmp=$(mktemp -d)
     state="$tmp/state.tsv"
     local rc=0
-    should_notify "anomaly-1" "$state" 21600 1000 || rc=$?
+    should_notify "anomaly-1" "$state" || rc=$?
     assert_eq "notifica sempre una nuova anomalia" "0" "$rc"
     rm -rf "$tmp"
 }
 
-test_should_notify_false_before_reminder_interval() {
+test_should_notify_only_once_while_anomaly_stays_open() {
     local tmp state
     tmp=$(mktemp -d)
     state="$tmp/state.tsv"
-    should_notify "anomaly-1" "$state" 21600 1000 >/dev/null
     local rc=0
-    should_notify "anomaly-1" "$state" 21600 2000 || rc=$?
-    assert_eq "non rinotifica prima dell'intervallo di reminder" "1" "$rc"
-    rm -rf "$tmp"
-}
-
-test_should_notify_true_after_reminder_interval() {
-    local tmp state
-    tmp=$(mktemp -d)
-    state="$tmp/state.tsv"
-    should_notify "anomaly-1" "$state" 21600 1000 >/dev/null
-    local rc=0
-    should_notify "anomaly-1" "$state" 21600 25000 || rc=$?
-    assert_eq "rinotifica dopo l'intervallo di reminder" "0" "$rc"
+    should_notify "anomaly-1" "$state" || rc=$?
+    assert_eq "notifica la prima volta" "0" "$rc"
+    rc=0
+    should_notify "anomaly-1" "$state" || rc=$?
+    assert_eq "non rinotifica una seconda volta senza clear_resolved, indipendentemente dal tempo trascorso" "1" "$rc"
     rm -rf "$tmp"
 }
 
@@ -481,11 +472,23 @@ test_clear_resolved_removes_entry() {
     local tmp state
     tmp=$(mktemp -d)
     state="$tmp/state.tsv"
-    should_notify "anomaly-1" "$state" 21600 1000 >/dev/null
+    should_notify "anomaly-1" "$state" >/dev/null
     clear_resolved "anomaly-1" "$state"
     local count
     count=$(grep -c "anomaly-1" "$state" 2>/dev/null || true)
     assert_eq "l'anomalia risolta viene rimossa dallo stato" "0" "$count"
+    rm -rf "$tmp"
+}
+
+test_should_notify_true_again_after_clear_resolved() {
+    local tmp state
+    tmp=$(mktemp -d)
+    state="$tmp/state.tsv"
+    should_notify "anomaly-1" "$state" >/dev/null
+    clear_resolved "anomaly-1" "$state"
+    local rc=0
+    should_notify "anomaly-1" "$state" || rc=$?
+    assert_eq "rinotifica come nuova occorrenza dopo clear_resolved" "0" "$rc"
     rm -rf "$tmp"
 }
 
@@ -567,9 +570,9 @@ test_send_slack_alert_returns_failure_on_http_500
 test_send_slack_alert_returns_failure_on_http_404
 test_send_slack_alert_fails_when_webhook_not_configured
 test_should_notify_true_for_new_anomaly
-test_should_notify_false_before_reminder_interval
-test_should_notify_true_after_reminder_interval
+test_should_notify_only_once_while_anomaly_stays_open
 test_clear_resolved_removes_entry
+test_should_notify_true_again_after_clear_resolved
 test_with_lock_prevents_concurrent_execution
 test_with_lock_runs_and_releases_when_free
 test_run_check_forwards_stdout_with_nonzero_return
