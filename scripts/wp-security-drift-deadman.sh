@@ -5,7 +5,7 @@ set -uo pipefail
 
 HEARTBEAT_FILE="${HEARTBEAT_FILE:-/root/state/wp-security-drift-heartbeat}"
 MAX_AGE_SECONDS="${MAX_AGE_SECONDS:-5400}"
-MAIL_TO="${MAIL_TO:-}"
+SLACK_WEBHOOK_URL_FILE="${SLACK_WEBHOOK_URL_FILE:-/root/.wp-security-slack-webhook}"
 
 heartbeat_is_stale() {
     local heartbeat_file="$1"
@@ -26,9 +26,23 @@ main() {
     local now
     now=$(date +%s)
     if heartbeat_is_stale "$HEARTBEAT_FILE" "$MAX_AGE_SECONDS" "$now"; then
-        [ -z "$MAIL_TO" ] && { echo "ERRORE: MAIL_TO non configurato" >&2; exit 1; }
-        echo "Il check wp-security-drift-check non ha aggiornato l'heartbeat entro la finestra attesa (max ${MAX_AGE_SECONDS}s)." \
-            | mail -s "[ALERT] wp-security-drift-check fermo su wordpress-php8" "$MAIL_TO"
+        [ ! -f "$SLACK_WEBHOOK_URL_FILE" ] || [ ! -s "$SLACK_WEBHOOK_URL_FILE" ] && \
+            { echo "ERRORE: SLACK_WEBHOOK_URL_FILE non configurato o vuoto" >&2; exit 1; }
+
+        local webhook_url
+        webhook_url=$(cat "$SLACK_WEBHOOK_URL_FILE")
+
+        local message="Il check wp-security-drift-check non ha aggiornato l'heartbeat entro la finestra attesa (max ${MAX_AGE_SECONDS}s)."
+
+        local http_code
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n --arg text "$message" '{text: $text}')" \
+            "$webhook_url")
+
+        if [ "$http_code" != "200" ]; then
+            echo "ERRORE: invio Slack fallito, HTTP $http_code" >&2
+            exit 1
+        fi
         exit 1
     fi
     exit 0
