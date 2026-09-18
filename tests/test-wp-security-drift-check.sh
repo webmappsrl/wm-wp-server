@@ -215,6 +215,74 @@ test_check_htaccess_detects_php_content() {
     rm -rf "$tmp"
 }
 
+test_check_unexpected_php_in_uploads_flags_unexpected_php() {
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/wp-content/uploads"
+    printf '<?php system($_GET["c"]); ?>' > "$tmp/wp-content/uploads/shell.php"
+    local out count
+    out=$(BOILERPLATE_FILE=/dev/null check_unexpected_php_in_uploads "$tmp")
+    count=$(echo "$out" | grep -c "shell.php" || true)
+    assert_eq "rileva file .php inaspettato in uploads/" "1" "$count"
+    rm -rf "$tmp"
+}
+
+test_check_unexpected_php_in_uploads_skips_wpml_twig_cache() {
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/wp-content/uploads/cache/wpml/twig"
+    printf '<?php // twig cache ?>' > "$tmp/wp-content/uploads/cache/wpml/twig/abc123.php"
+    local out
+    out=$(BOILERPLATE_FILE=/dev/null check_unexpected_php_in_uploads "$tmp")
+    assert_eq "non segnala file in cache/wpml/twig/ (whitelist nota)" "" "$out"
+    rm -rf "$tmp"
+}
+
+test_check_unexpected_php_in_uploads_skips_sucuri() {
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/wp-content/uploads/sucuri"
+    printf '<?php // dati sucuri ?>' > "$tmp/wp-content/uploads/sucuri/sucuri-datastore.php"
+    local out
+    out=$(BOILERPLATE_FILE=/dev/null check_unexpected_php_in_uploads "$tmp")
+    assert_eq "non segnala file in sucuri/ (whitelist nota)" "" "$out"
+    rm -rf "$tmp"
+}
+
+test_check_unexpected_php_in_uploads_skips_charmap() {
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/wp-content/uploads/fonts/some-font"
+    printf '<?php // charmap ?>' > "$tmp/wp-content/uploads/fonts/some-font/charmap.php"
+    local out
+    out=$(BOILERPLATE_FILE=/dev/null check_unexpected_php_in_uploads "$tmp")
+    assert_eq "non segnala charmap.php (whitelist nota)" "" "$out"
+    rm -rf "$tmp"
+}
+
+test_check_unexpected_php_in_uploads_missing_uploads_dir() {
+    local tmp
+    tmp=$(mktemp -d)
+    local out rc=0
+    out=$(BOILERPLATE_FILE=/dev/null check_unexpected_php_in_uploads "$tmp") || rc=$?
+    assert_eq "nessun errore se uploads/ non esiste" "0" "$rc"
+    assert_eq "nessun output se uploads/ non esiste" "" "$out"
+    rm -rf "$tmp"
+}
+
+test_check_unexpected_php_in_uploads_skips_whitelisted_index() {
+    local tmp boilerplate
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/wp-content/uploads"
+    boilerplate=$(mktemp)
+    printf '<?php\n// Silence is golden.\n' > "$tmp/wp-content/uploads/index.php"
+    md5sum "$tmp/wp-content/uploads/index.php" | cut -d' ' -f1 > "$boilerplate"
+    local out
+    out=$(BOILERPLATE_FILE="$boilerplate" check_unexpected_php_in_uploads "$tmp")
+    assert_eq "index.php boilerplate in uploads/ non genera output" "" "$out"
+    rm -rf "$tmp" "$boilerplate"
+}
+
 test_check_index_integrity_flags_core_mismatch() {
     local tmp
     tmp=$(mktemp -d)
@@ -446,6 +514,12 @@ test_check_ioc_files_detects_php_in_image_extension
 test_check_ioc_files_detects_php_tag_not_at_start
 test_check_htaccess_detects_known_signature
 test_check_htaccess_detects_php_content
+test_check_unexpected_php_in_uploads_flags_unexpected_php
+test_check_unexpected_php_in_uploads_skips_wpml_twig_cache
+test_check_unexpected_php_in_uploads_skips_sucuri
+test_check_unexpected_php_in_uploads_skips_charmap
+test_check_unexpected_php_in_uploads_missing_uploads_dir
+test_check_unexpected_php_in_uploads_skips_whitelisted_index
 test_check_index_integrity_flags_core_mismatch
 test_check_index_integrity_passes_core_match
 test_check_index_integrity_recognizes_boilerplate
