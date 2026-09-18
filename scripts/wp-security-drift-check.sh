@@ -3,11 +3,6 @@
 # Controllo periodico drift protezioni anti-malware — oc:8558
 set -uo pipefail
 
-# Ensure GNU grep is in PATH (for PCRE support with -P flag)
-if [ -d "/opt/homebrew/opt/grep/libexec/gnubin" ]; then
-    export PATH="/opt/homebrew/opt/grep/libexec/gnubin:${PATH:-}"
-fi
-
 APACHE_SITES_ENABLED_DIR="${APACHE_SITES_ENABLED_DIR:-/etc/apache2/sites-enabled}"
 
 enumerate_sites() {
@@ -17,7 +12,7 @@ enumerate_sites() {
 
     for conf in "$conf_dir"/*.conf; do
         [ -f "$conf" ] || continue
-        domain=$(grep -m1 -oP '(?<=ServerName\s)\S+' "$conf" 2>/dev/null)
+        domain=$(grep -m1 -oP 'ServerName\s+\K\S+' "$conf" 2>/dev/null)
         while IFS= read -r root; do
             root=$(echo "$root" | xargs)
             [ -z "$root" ] && continue
@@ -26,7 +21,7 @@ enumerate_sites() {
                 seen_roots[$root]=1
                 echo "${domain:-unknown}|$root"
             fi
-        done < <(grep -oP '(?<=DocumentRoot\s)\S+' "$conf" 2>/dev/null)
+        done < <(grep -oP 'DocumentRoot\s+\K\S+' "$conf" 2>/dev/null)
     done
 }
 
