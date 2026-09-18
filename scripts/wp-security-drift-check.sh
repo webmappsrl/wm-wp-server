@@ -235,10 +235,7 @@ log() {
 run_check() {
     local name="$1"; shift
     local output
-    if ! output=$("$@" 2>&1); then
-        log "ERRORE nel check '$name': $output"
-        return
-    fi
+    output=$("$@" 2>&1) || true
     if [ -n "$output" ]; then
         echo "$output"
     fi
