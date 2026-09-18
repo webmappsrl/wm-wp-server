@@ -269,6 +269,9 @@ main() {
         out=$(run_check "htaccess" check_htaccess "$docroot")
         [ -n "$out" ] && anomalies+=("[$domain] $out")
 
+        out=$(run_check "uploads-php" check_unexpected_php_in_uploads "$docroot")
+        [ -n "$out" ] && anomalies+=("[$domain] $out")
+
         local wp_version checksums_json
         wp_version=$(get_wp_version "$docroot")
         if [ -n "$wp_version" ]; then
@@ -293,6 +296,43 @@ main() {
 
     mkdir -p "$(dirname "$HEARTBEAT_FILE")" 2>/dev/null || true
     date +%s > "$HEARTBEAT_FILE"
+}
+
+check_unexpected_php_in_uploads() {
+    local docroot="$1"
+    local uploads_dir="$docroot/wp-content/uploads"
+    [ -d "$uploads_dir" ] || return 0
+
+    local boilerplate_file="${BOILERPLATE_FILE:-config/index-boilerplate-whitelist.txt}"
+    local f relpath base md5
+
+    while IFS= read -r -d '' f; do
+        relpath="${f#$uploads_dir/}"
+        base="$(basename "$f")"
+
+        case "$relpath" in
+            cache/wpml/twig/*) continue ;;
+            sucuri/*) continue ;;
+            wpforms/cache/*) continue ;;
+        esac
+
+        case "$base" in
+            charmap.php) continue ;;
+            debug-log.php)
+                if head -c 20 "$f" 2>/dev/null | grep -qE '^<\?php exit'; then
+                    continue
+                fi
+                ;;
+            index.php)
+                md5=$(md5sum "$f" | cut -d' ' -f1)
+                if [ -f "$boilerplate_file" ] && grep -qxF "$md5" "$boilerplate_file"; then
+                    continue
+                fi
+                ;;
+        esac
+
+        echo "IOC: $f — file .php/.phtml/.phar inaspettato in uploads/ (non in whitelist nota)"
+    done < <(find "$uploads_dir" -type f \( -iname "*.php" -o -iname "*.phtml" -o -iname "*.phar" \) -print0 2>/dev/null)
 }
 
 if [[ "${1:-}" != "--source-only" ]]; then
