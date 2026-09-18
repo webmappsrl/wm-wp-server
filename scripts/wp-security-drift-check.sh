@@ -66,3 +66,31 @@ is_exception() {
     [ -f "$exceptions_file" ] || return 1
     grep -qxF "$domain" "$exceptions_file"
 }
+
+IOC_EXTENSIONS="jpg jpeg png gif ico wav mp4 wmv jpc avi ttf css svg"
+HTACCESS_KNOWN_BAD_MD5="${HTACCESS_KNOWN_BAD_MD5:-ee7f30053bde324521dd69e117781ad3}"
+
+check_ioc_files() {
+    local docroot="$1"
+    local ext f
+    for ext in $IOC_EXTENSIONS; do
+        while IFS= read -r -d '' f; do
+            if head -c 4096 "$f" 2>/dev/null | grep -qE '<\?php|<\?='; then
+                echo "IOC: $f contiene un tag PHP nonostante l'estensione .$ext"
+            fi
+        done < <(find "$docroot" -type f -iname "*.$ext" -print0 2>/dev/null)
+    done
+}
+
+check_htaccess() {
+    local docroot="$1"
+    local f sum
+    while IFS= read -r -d '' f; do
+        sum=$(md5sum "$f" | cut -d' ' -f1)
+        if [ "$sum" = "$HTACCESS_KNOWN_BAD_MD5" ]; then
+            echo "IOC: $f corrisponde alla firma nota di oc:8547"
+        elif grep -qE '<\?php|<\?=' "$f" 2>/dev/null; then
+            echo "IOC: $f è sospetto (contenuto PHP in un .htaccess)"
+        fi
+    done < <(find "$docroot" -type f -name ".htaccess" -print0 2>/dev/null)
+}
