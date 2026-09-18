@@ -91,7 +91,7 @@ test_check_apache_protection_enabled_detects_missing_mount_path() {
     php_admin_flag engine off
 </DirectoryMatch>
 EOF
-    local out rc
+    local out rc=0
     out=$(check_apache_protection_enabled "$tmp/no-php-in-writable.conf") || rc=$?
     assert_eq "rileva copertura mancante sul volume montato" "1" "$rc"
     rm -rf "$tmp"
