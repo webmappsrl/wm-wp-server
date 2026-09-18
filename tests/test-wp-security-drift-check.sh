@@ -3,7 +3,7 @@
 if [ -d "/opt/homebrew/opt/grep/libexec/gnubin" ]; then
     export PATH="/opt/homebrew/opt/grep/libexec/gnubin:$PATH"
 fi
-set -euo pipefail
+set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../scripts/wp-security-drift-check.sh" --source-only 2>/dev/null || \
 source "$SCRIPT_DIR/../scripts/wp-security-drift-check.sh"
@@ -293,6 +293,103 @@ test_baseline_write_persists_candidates() {
     rm -rf "$tmp"
 }
 
+start_mock_http_server() {
+    local port="$1" status_code="$2"
+    (
+        exec python3 -c "
+import http.server, socketserver
+socketserver.TCPServer.allow_reuse_address = True
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.send_response($status_code)
+        self.end_headers()
+    def log_message(self, *args): pass
+with socketserver.TCPServer(('127.0.0.1', $port), Handler) as httpd:
+    httpd.timeout = 10
+    httpd.handle_request()
+" &
+    ) >/dev/null 2>&1
+    sleep 0.1
+    echo $!
+}
+
+test_send_slack_alert_returns_success_on_http_200() {
+    local port=18080 pid rc
+    pid=$(start_mock_http_server "$port" 200)
+    sleep 2
+    send_slack_alert "messaggio di test" "http://127.0.0.1:$port/webhook" ; rc=$?
+    assert_eq "successo quando il webhook risponde 200" "0" "$rc"
+    wait "$pid" 2>/dev/null || true
+}
+
+test_send_slack_alert_returns_failure_on_http_500() {
+    local port=18081 pid rc
+    pid=$(start_mock_http_server "$port" 500)
+    sleep 2
+    send_slack_alert "messaggio di test" "http://127.0.0.1:$port/webhook" ; rc=$?
+    assert_eq "fallimento quando il webhook risponde 500" "1" "$rc"
+    wait "$pid" 2>/dev/null || true
+}
+
+test_send_slack_alert_returns_failure_on_http_404() {
+    local port=18082 pid rc
+    pid=$(start_mock_http_server "$port" 404)
+    sleep 2
+    send_slack_alert "messaggio di test" "http://127.0.0.1:$port/webhook" ; rc=$?
+    assert_eq "fallimento quando il canale/webhook non è più valido (404)" "1" "$rc"
+    wait "$pid" 2>/dev/null || true
+}
+
+test_send_slack_alert_fails_when_webhook_not_configured() {
+    local rc
+    send_slack_alert "messaggio di test" "" ; rc=$?
+    assert_eq "fallisce subito se il webhook non è configurato" "1" "$rc"
+}
+
+test_should_notify_true_for_new_anomaly() {
+    local tmp state
+    tmp=$(mktemp -d)
+    state="$tmp/state.tsv"
+    local rc
+    should_notify "anomaly-1" "$state" 21600 1000 ; rc=$?
+    assert_eq "notifica sempre una nuova anomalia" "0" "$rc"
+    rm -rf "$tmp"
+}
+
+test_should_notify_false_before_reminder_interval() {
+    local tmp state
+    tmp=$(mktemp -d)
+    state="$tmp/state.tsv"
+    should_notify "anomaly-1" "$state" 21600 1000 >/dev/null
+    local rc
+    should_notify "anomaly-1" "$state" 21600 2000 ; rc=$?
+    assert_eq "non rinotifica prima dell'intervallo di reminder" "1" "$rc"
+    rm -rf "$tmp"
+}
+
+test_should_notify_true_after_reminder_interval() {
+    local tmp state
+    tmp=$(mktemp -d)
+    state="$tmp/state.tsv"
+    should_notify "anomaly-1" "$state" 21600 1000 >/dev/null
+    local rc
+    should_notify "anomaly-1" "$state" 21600 25000 ; rc=$?
+    assert_eq "rinotifica dopo l'intervallo di reminder" "0" "$rc"
+    rm -rf "$tmp"
+}
+
+test_clear_resolved_removes_entry() {
+    local tmp state
+    tmp=$(mktemp -d)
+    state="$tmp/state.tsv"
+    should_notify "anomaly-1" "$state" 21600 1000 >/dev/null
+    clear_resolved "anomaly-1" "$state"
+    local count
+    count=$(grep -c "anomaly-1" "$state" 2>/dev/null || true)
+    assert_eq "l'anomalia risolta viene rimossa dallo stato" "0" "$count"
+    rm -rf "$tmp"
+}
+
 test_enumerate_sites_finds_two_distinct_docroots
 test_enumerate_sites_empty_dir_returns_zero
 test_enumerate_sites_multi_space_and_tabs
@@ -312,5 +409,13 @@ test_check_index_integrity_recognizes_boilerplate
 test_check_index_integrity_flags_unrecognized_file
 test_baseline_diff_shows_new_files_when_no_baseline_exists
 test_baseline_write_persists_candidates
+test_send_slack_alert_returns_success_on_http_200
+test_send_slack_alert_returns_failure_on_http_500
+test_send_slack_alert_returns_failure_on_http_404
+test_send_slack_alert_fails_when_webhook_not_configured
+test_should_notify_true_for_new_anomaly
+test_should_notify_false_before_reminder_interval
+test_should_notify_true_after_reminder_interval
+test_clear_resolved_removes_entry
 
 exit $FAIL
