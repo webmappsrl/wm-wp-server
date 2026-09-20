@@ -167,16 +167,32 @@ send_slack_alert() {
 should_notify() {
     local anomaly_id="$1"
     local state_file="$2"
+    local current_count="$3"
 
     mkdir -p "$(dirname "$state_file")" 2>/dev/null || true
     touch "$state_file"
 
-    if grep -qxF "${anomaly_id}"$'\t'"notificata" "$state_file" 2>/dev/null; then
-        # Già presente nello stato: già notificata una volta, resta aperta. Niente reminder.
+    local previous_count
+    previous_count=$(awk -F'\t' -v id="$anomaly_id" '$1 == id {print $2; exit}' "$state_file" 2>/dev/null)
+
+    if [ -z "$previous_count" ]; then
+        # Nessuna entry per questo anomaly_id: prima notifica.
+        echo -e "${anomaly_id}\t${current_count}" >> "$state_file"
+        return 0
+    fi
+
+    if [ "$previous_count" = "$current_count" ]; then
+        # Stessa situazione dell'ultima notifica (stesso numero di reperti): niente reminder.
         return 1
     fi
 
-    echo -e "${anomaly_id}\tnotificata" >> "$state_file"
+    # Il conteggio è cambiato (in più o in meno) rispetto all'ultima notifica: situazione
+    # diversa, va rinotificata anche se l'anomaly_id era già "notificata" in passato.
+    local tmp_state
+    tmp_state=$(mktemp)
+    awk -F'\t' -v id="$anomaly_id" '$1 != id' "$state_file" > "$tmp_state" || true
+    mv "$tmp_state" "$state_file"
+    echo -e "${anomaly_id}\t${current_count}" >> "$state_file"
     return 0
 }
 
@@ -186,7 +202,7 @@ clear_resolved() {
     [ -f "$state_file" ] || return 0
     local tmp_state
     tmp_state=$(mktemp)
-    grep -vxF "${anomaly_id}"$'\t'"notificata" "$state_file" > "$tmp_state" || true
+    awk -F'\t' -v id="$anomaly_id" '$1 != id' "$state_file" > "$tmp_state" || true
     mv "$tmp_state" "$state_file"
 }
 
@@ -328,7 +344,7 @@ main() {
         anomaly_id="${anomaly_domain}:${anomaly_check}"
 
         log "$log_line"
-        if should_notify "$anomaly_id" "$STATE_FILE"; then
+        if should_notify "$anomaly_id" "$STATE_FILE" "$anomaly_count"; then
             slack_message="[$anomaly_domain] ${anomaly_check}: ${anomaly_count} anomalie rilevate — vedi log su wordpress-php8:/var/log/wp-security-drift-check.log"
             send_slack_alert "$slack_message" "$webhook_url" || log "invio Slack fallito per: $log_line"
         fi
