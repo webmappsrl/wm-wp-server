@@ -35,7 +35,7 @@ main() {
         local message="Il check wp-security-drift-check non ha aggiornato l'heartbeat entro la finestra attesa (max ${MAX_AGE_SECONDS}s)."
 
         local http_code
-        http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
+        http_code=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
             --data "$(jq -n --arg text "$message" '{text: $text}')" \
             "$webhook_url")
 
