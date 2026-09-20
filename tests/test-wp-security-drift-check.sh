@@ -612,6 +612,34 @@ test_should_notify_true_again_after_clear_resolved() {
     rm -rf "$tmp"
 }
 
+test_should_notify_not_suppressed_by_suffix_domain_entry() {
+    # Regression oc:8558: "maremma.it:htaccess" è suffisso di "parco-maremma.it:htaccess".
+    # Con grep -qF (senza -x) la riga esistente per il dominio più lungo faceva match anche
+    # per il dominio più corto/distinto, sopprimendo erroneamente una nuova anomalia.
+    local tmp state
+    tmp=$(mktemp -d)
+    state="$tmp/state.tsv"
+    printf 'parco-maremma.it:htaccess\tnotificata\n' > "$state"
+    local rc=0
+    should_notify "maremma.it:htaccess" "$state" || rc=$?
+    assert_eq "anomalia di un dominio suffisso non viene soppressa da un'entry di un dominio più lungo" "0" "$rc"
+    rm -rf "$tmp"
+}
+
+test_clear_resolved_does_not_remove_longer_domain_entry() {
+    # Regression oc:8558: clear_resolved su "maremma.it:htaccess" non deve rimuovere l'entry
+    # di "parco-maremma.it:htaccess" (falso match per sottostringa con grep -vF senza -x).
+    local tmp state
+    tmp=$(mktemp -d)
+    state="$tmp/state.tsv"
+    printf 'parco-maremma.it:htaccess\tnotificata\n' > "$state"
+    clear_resolved "maremma.it:htaccess" "$state"
+    local rc=0
+    grep -qxF "parco-maremma.it:htaccess"$'\t'"notificata" "$state" || rc=$?
+    assert_eq "l'entry del dominio più lungo resta nello stato dopo clear_resolved sul suffisso" "0" "$rc"
+    rm -rf "$tmp"
+}
+
 test_with_lock_prevents_concurrent_execution() {
     local tmp lockfile
     tmp=$(mktemp -d)
@@ -700,6 +728,8 @@ test_should_notify_true_for_new_anomaly
 test_should_notify_only_once_while_anomaly_stays_open
 test_clear_resolved_removes_entry
 test_should_notify_true_again_after_clear_resolved
+test_should_notify_not_suppressed_by_suffix_domain_entry
+test_clear_resolved_does_not_remove_longer_domain_entry
 test_with_lock_prevents_concurrent_execution
 test_with_lock_runs_and_releases_when_free
 test_run_check_forwards_stdout_with_nonzero_return

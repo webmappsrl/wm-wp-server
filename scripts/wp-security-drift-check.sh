@@ -171,7 +171,7 @@ should_notify() {
     mkdir -p "$(dirname "$state_file")" 2>/dev/null || true
     touch "$state_file"
 
-    if grep -qF "${anomaly_id}"$'\t' "$state_file" 2>/dev/null; then
+    if grep -qxF "${anomaly_id}"$'\t'"notificata" "$state_file" 2>/dev/null; then
         # Già presente nello stato: già notificata una volta, resta aperta. Niente reminder.
         return 1
     fi
@@ -186,7 +186,7 @@ clear_resolved() {
     [ -f "$state_file" ] || return 0
     local tmp_state
     tmp_state=$(mktemp)
-    grep -vF "${anomaly_id}"$'\t' "$state_file" > "$tmp_state" || true
+    grep -vxF "${anomaly_id}"$'\t'"notificata" "$state_file" > "$tmp_state" || true
     mv "$tmp_state" "$state_file"
 }
 
