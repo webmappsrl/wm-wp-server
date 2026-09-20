@@ -412,6 +412,126 @@ with socketserver.TCPServer(('127.0.0.1', $port), Handler) as httpd:
     echo "$pid"
 }
 
+start_mock_html_server() {
+    local port="$1" content_file="$2"
+    python3 -c "
+import http.server, socketserver
+socketserver.TCPServer.allow_reuse_address = True
+with open('$content_file', 'rb') as f:
+    BODY = f.read()
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(BODY)
+    def log_message(self, *args): pass
+with socketserver.TCPServer(('127.0.0.1', $port), Handler) as httpd:
+    httpd.timeout = 10
+    httpd.handle_request()
+" >/dev/null 2>&1 &
+    local pid=$!
+    echo "$pid"
+}
+
+test_check_homepage_redirect_detects_ushort_company_signature() {
+    local tmp html_file port pid rc=0 out count
+    tmp=$(mktemp -d)
+    html_file="$tmp/index.html"
+    printf '<html><body>Contenuto normale, ushort.company nel testo</body></html>' > "$html_file"
+    port=18090
+    pid=$(start_mock_html_server "$port" "$html_file")
+    sleep 2
+    out=$(HOMEPAGE_SCHEME=http check_homepage_redirect "127.0.0.1:$port") || rc=$?
+    count=$(printf '%s\n' "$out" | grep -c "IOC" || true)
+    assert_eq "rileva la firma nota ushort.company (oc:8547/oc:8558)" "1" "$count"
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+
+test_check_homepage_redirect_detects_maintenance_signature() {
+    local tmp html_file port pid rc=0 out count
+    tmp=$(mktemp -d)
+    html_file="$tmp/index.html"
+    printf '<html><body>Briefly unavailable for scheduled maintenance</body></html>' > "$html_file"
+    port=18091
+    pid=$(start_mock_html_server "$port" "$html_file")
+    sleep 2
+    out=$(HOMEPAGE_SCHEME=http check_homepage_redirect "127.0.0.1:$port") || rc=$?
+    count=$(printf '%s\n' "$out" | grep -c "IOC" || true)
+    assert_eq "rileva la firma nota 'Briefly unavailable for scheduled maintenance'" "1" "$count"
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+
+test_check_homepage_redirect_flags_external_redirect() {
+    local tmp html_file port pid rc=0 out count
+    tmp=$(mktemp -d)
+    html_file="$tmp/index.html"
+    printf '<html><script>location.replace("//some-completely-different-domain.evil/x");</script></html>' > "$html_file"
+    port=18092
+    pid=$(start_mock_html_server "$port" "$html_file")
+    sleep 2
+    out=$(HOMEPAGE_SCHEME=http check_homepage_redirect "127.0.0.1:$port") || rc=$?
+    count=$(printf '%s\n' "$out" | grep -c "dominio esterno" || true)
+    assert_eq "rileva redirect client-side verso un dominio diverso dal proprio" "1" "$count"
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+
+test_check_homepage_redirect_ignores_internal_redirect() {
+    local tmp html_file port pid rc=0 out
+    tmp=$(mktemp -d)
+    html_file="$tmp/index.html"
+    port=18093
+    printf '<html><script>location.href = "https://127.0.0.1:%s/some-page";</script></html>' "$port" > "$html_file"
+    pid=$(start_mock_html_server "$port" "$html_file")
+    sleep 2
+    out=$(HOMEPAGE_SCHEME=http check_homepage_redirect "127.0.0.1:$port") || rc=$?
+    assert_eq "non segnala un redirect verso il proprio stesso dominio (navigazione interna)" "" "$out"
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+
+test_check_homepage_redirect_clean_homepage_no_anomaly() {
+    local tmp html_file port pid rc=0 out
+    tmp=$(mktemp -d)
+    html_file="$tmp/index.html"
+    printf '<html><body>Homepage pulita, nessuna anomalia</body></html>' > "$html_file"
+    port=18094
+    pid=$(start_mock_html_server "$port" "$html_file")
+    sleep 2
+    out=$(HOMEPAGE_SCHEME=http check_homepage_redirect "127.0.0.1:$port") || rc=$?
+    assert_eq "homepage pulita non genera output" "" "$out"
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+
+test_check_homepage_redirect_unreachable_site_returns_cleanly() {
+    local rc=0 out
+    out=$(check_homepage_redirect "127.0.0.1:1") || rc=$?
+    assert_eq "sito irraggiungibile: nessun errore" "0" "$rc"
+    assert_eq "sito irraggiungibile: nessun output (non è un uptime monitor)" "" "$out"
+}
+
+test_check_homepage_redirect_detects_real_attack_string() {
+    local tmp html_file port pid rc=0 out sig_count redirect_count
+    tmp=$(mktemp -d)
+    html_file="$tmp/index.html"
+    # Stringa reale trovata oggi in wp-admin/index.php su valdicecinaoutdoor.it (oc:8547/oc:8558)
+    printf '%s' 'location.replace("//ushort.company/pxCXpSDmu0r6")' > "$html_file"
+    port=18095
+    pid=$(start_mock_html_server "$port" "$html_file")
+    sleep 2
+    out=$(HOMEPAGE_SCHEME=http check_homepage_redirect "127.0.0.1:$port") || rc=$?
+    sig_count=$(printf '%s\n' "$out" | grep -c "firma nota 'ushort.company'" || true)
+    redirect_count=$(printf '%s\n' "$out" | grep -c "dominio esterno" || true)
+    assert_eq "la stringa reale dell'attacco viene riconosciuta come firma nota" "1" "$sig_count"
+    assert_eq "la stringa reale dell'attacco viene riconosciuta anche come redirect esterno" "1" "$redirect_count"
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+
 test_send_slack_alert_returns_success_on_http_200() {
     local port=18080 pid rc=0
     pid=$(start_mock_http_server "$port" 200)
@@ -565,6 +685,13 @@ test_check_index_integrity_recognizes_boilerplate
 test_check_index_integrity_flags_unrecognized_file
 test_baseline_diff_shows_new_files_when_no_baseline_exists
 test_baseline_write_persists_candidates
+test_check_homepage_redirect_detects_ushort_company_signature
+test_check_homepage_redirect_detects_maintenance_signature
+test_check_homepage_redirect_flags_external_redirect
+test_check_homepage_redirect_ignores_internal_redirect
+test_check_homepage_redirect_clean_homepage_no_anomaly
+test_check_homepage_redirect_unreachable_site_returns_cleanly
+test_check_homepage_redirect_detects_real_attack_string
 test_send_slack_alert_returns_success_on_http_200
 test_send_slack_alert_returns_failure_on_http_500
 test_send_slack_alert_returns_failure_on_http_404

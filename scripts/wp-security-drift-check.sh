@@ -212,6 +212,8 @@ EXCEPTIONS_FILE="${EXCEPTIONS_FILE:-/root/config/disallow-exceptions.conf}"
 BOILERPLATE_FILE="${BOILERPLATE_FILE:-/root/config/index-boilerplate-whitelist.txt}"
 NO_PHP_CONF="${NO_PHP_CONF:-/etc/apache2/conf-available/no-php-in-writable.conf}"
 SLACK_WEBHOOK_URL_FILE="${SLACK_WEBHOOK_URL_FILE:-/root/.wp-security-slack-webhook}"
+# In produzione è sempre https; override consentito solo per i test (mock server locale in http).
+HOMEPAGE_SCHEME="${HOMEPAGE_SCHEME:-https}"
 
 log() {
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
@@ -279,6 +281,15 @@ main() {
             anomaly_domains+=("$domain"); anomaly_checks+=("uploads-php"); anomaly_details+=("$out")
         else
             clear_resolved "$domain:uploads-php" "$STATE_FILE"
+        fi
+
+        # A differenza degli altri check, questo non legge il filesystem (docroot) ma fa una
+        # fetch HTTP live della homepage pubblica: prende $domain, non $docroot.
+        out=$(run_check "homepage-redirect" check_homepage_redirect "$domain")
+        if [ -n "$out" ]; then
+            anomaly_domains+=("$domain"); anomaly_checks+=("homepage-redirect"); anomaly_details+=("$out")
+        else
+            clear_resolved "$domain:homepage-redirect" "$STATE_FILE"
         fi
 
         local wp_version checksums_json
@@ -362,6 +373,48 @@ check_unexpected_php_in_uploads() {
 
         echo "IOC: $f — file .php/.phtml/.phar inaspettato in uploads/ (non in whitelist nota)"
     done < <(find "$uploads_dir" -type f \( -iname "*.php" -o -iname "*.phtml" -o -iname "*.phar" \) -print0 2>/dev/null)
+}
+
+# Firme note dalla campagna attiva oc:8547/oc:8558 (già catalogate nel vecchio cron script
+# che questo progetto sostituisce), viste verbatim nell'attacco reale su valdicecinaoutdoor.it.
+HOMEPAGE_KNOWN_BAD_SIGNATURES=("ushort.company" "Briefly unavailable for scheduled maintenance")
+
+check_homepage_redirect() {
+    local domain="$1"
+    local html
+    # "|| true" (stesso idioma di run_check/baseline_diff/clear_resolved): un curl fallito
+    # (timeout, connection refused, ecc.) non deve interrompere lo script sotto set -e — è
+    # gestito subito sotto come "nessun body ricevuto", non come un errore.
+    html=$(curl -sS --max-time 10 -A 'Mozilla/5.0 (compatible; wp-security-drift-check)' \
+        "${HOMEPAGE_SCHEME}://${domain}/" 2>/dev/null) || true
+
+    # Homepage irraggiungibile/vuota (timeout, connection refused, nessun body): non è la stessa
+    # cosa di "trovato malware" — questo check non è un uptime monitor, esce pulito senza output.
+    [ -z "$html" ] && return 0
+
+    local sig
+    for sig in "${HOMEPAGE_KNOWN_BAD_SIGNATURES[@]}"; do
+        if grep -qF -- "$sig" <<< "$html"; then
+            echo "IOC: homepage di $domain contiene la firma nota '$sig' (oc:8547/oc:8558)"
+        fi
+    done
+
+    local redirect_pattern
+    redirect_pattern="location\.replace\([^)]*\)"
+    redirect_pattern+="|location\.href[[:space:]]*=[[:space:]]*[^;]*"
+    redirect_pattern+="|<meta[^>]*http-equiv=[\"']?refresh[\"']?[^>]*>"
+
+    local match
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        # Flag solo se il target del redirect NON contiene il dominio del sito stesso
+        # (case-insensitive): un redirect interno (stesso dominio) non è un'anomalia.
+        if ! grep -qiF -- "$domain" <<< "$match"; then
+            echo "IOC: homepage di $domain contiene un redirect client-side verso un dominio esterno: $match"
+        fi
+    done < <(grep -oE "$redirect_pattern" <<< "$html" 2>/dev/null)
+
+    return 0
 }
 
 if [[ "${1:-}" != "--source-only" ]]; then
