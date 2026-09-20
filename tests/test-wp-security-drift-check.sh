@@ -507,6 +507,40 @@ test_check_homepage_redirect_ignores_bare_variable_target() {
     rm -rf "$tmp"
 }
 
+test_check_homepage_redirect_flags_meta_refresh_url_equals_external() {
+    # Regressione: il formato standard del meta-refresh (`content="0;url=https://…"`) NON ha
+    # la virgoletta adiacente allo schema/"//" — è "url=" che precede lo schema. Il pattern
+    # letterale deve riconoscere anche questa forma (case-insensitive su "url").
+    local tmp html_file port pid rc=0 out count
+    tmp=$(mktemp -d)
+    html_file="$tmp/index.html"
+    printf '<html><head><meta http-equiv="refresh" content="0;url=https://evil.example"></head></html>' > "$html_file"
+    port=18097
+    pid=$(start_mock_html_server "$port" "$html_file")
+    sleep 2
+    out=$(HOMEPAGE_SCHEME=http check_homepage_redirect "127.0.0.1:$port") || rc=$?
+    count=$(printf '%s\n' "$out" | grep -c "dominio esterno" || true)
+    assert_eq "rileva meta-refresh formato standard content=\"N;url=https://…\" come redirect esterno" "1" "$count"
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+
+test_check_homepage_redirect_ignores_meta_refresh_url_equals_internal() {
+    # Stesso formato "url=" del meta-refresh, ma verso il dominio stesso del sito: non è
+    # un'anomalia, coerente con la logica interno/esterno già esistente.
+    local tmp html_file port pid rc=0 out
+    tmp=$(mktemp -d)
+    html_file="$tmp/index.html"
+    port=18098
+    printf '<html><head><meta http-equiv="refresh" content="0; url=//127.0.0.1:%s/page"></head></html>' "$port" > "$html_file"
+    pid=$(start_mock_html_server "$port" "$html_file")
+    sleep 2
+    out=$(HOMEPAGE_SCHEME=http check_homepage_redirect "127.0.0.1:$port") || rc=$?
+    assert_eq "non segnala meta-refresh url= verso il proprio stesso dominio (interno)" "" "$out"
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+
 test_check_homepage_redirect_clean_homepage_no_anomaly() {
     local tmp html_file port pid rc=0 out
     tmp=$(mktemp -d)
@@ -764,6 +798,8 @@ test_check_homepage_redirect_detects_maintenance_signature
 test_check_homepage_redirect_flags_external_redirect
 test_check_homepage_redirect_ignores_internal_redirect
 test_check_homepage_redirect_ignores_bare_variable_target
+test_check_homepage_redirect_flags_meta_refresh_url_equals_external
+test_check_homepage_redirect_ignores_meta_refresh_url_equals_internal
 test_check_homepage_redirect_clean_homepage_no_anomaly
 test_check_homepage_redirect_unreachable_site_returns_cleanly
 test_check_homepage_redirect_detects_real_attack_string
