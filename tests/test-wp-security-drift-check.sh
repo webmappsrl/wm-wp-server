@@ -434,6 +434,51 @@ with socketserver.TCPServer(('127.0.0.1', $port), Handler) as httpd:
     echo "$pid"
 }
 
+start_mock_http_recording_server() {
+    # Variante di start_mock_http_server che NON serve una sola richiesta: resta in ascolto
+    # finché non viene killata e registra ogni POST ricevuta su $requests_file (una riga per
+    # richiesta, col body). Serve al test di integrazione su main(), che deve poter contare
+    # esattamente quante notifiche Slack sono partite in una run completa — né una in meno
+    # (anomalia soppressa) né una in più (stessa anomalia notificata N volte).
+    local port="$1" status_code="$2" requests_file="$3"
+    : > "$requests_file"
+    python3 -c "
+import http.server, socketserver
+socketserver.TCPServer.allow_reuse_address = True
+REQUESTS_FILE = '$requests_file'
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length') or 0)
+        body = self.rfile.read(length)
+        # Scritto PRIMA della risposta: quando curl ritorna, la richiesta è già registrata.
+        with open(REQUESTS_FILE, 'ab') as fh:
+            fh.write(body.replace(b'\n', b' ') + b'\n')
+        self.send_response($status_code)
+        self.end_headers()
+    def log_message(self, *args): pass
+with socketserver.TCPServer(('127.0.0.1', $port), Handler) as httpd:
+    httpd.serve_forever()
+" >/dev/null 2>&1 &
+    echo $!
+}
+
+wait_for_mock_server() {
+    local port="$1" i
+    for i in $(seq 1 100); do
+        if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:${port}/" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+stop_mock_server() {
+    local pid="$1"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
 test_check_homepage_redirect_detects_ushort_company_signature() {
     local tmp html_file port pid rc=0 out count
     tmp=$(mktemp -d)
@@ -765,6 +810,149 @@ test_run_check_empty_output_with_zero_return() {
     assert_eq "run_check non produce output per check pulito (return 0, no stdout)" "" "$out"
 }
 
+test_main_end_to_end_two_sites_suffix_domains() {
+    # Test di integrazione su main(): è l'unico che esercita l'orchestrazione completa
+    # (enumerazione vhost → check per dominio → log → stato → notifiche Slack → heartbeat).
+    # I bug che copre vivevano tutti nel cablaggio di main(), non nelle singole funzioni, e
+    # nessun test unitario per-funzione avrebbe potuto intercettarli:
+    #   - regola Apache eseguita una sola volta per run, non una per sito;
+    #   - anomalie di due domini di cui uno è suffisso dell'altro tracciate separatamente;
+    #   - una seconda run identica non rinotifica nulla.
+    local tmp port pid
+    tmp=$(mktemp -d)
+    port=18099
+
+    # --- vhost: due siti il cui dominio è suffisso dell'altro --------------------------
+    # L'ordine di enumerazione conta: i vhost sono letti in ordine di glob e il dominio PIÙ
+    # LUNGO (parco-maremma.it) deve finire nello stato PRIMA di quello più corto
+    # (maremma.it). È esattamente lo scenario in cui il vecchio matching per sottostringa in
+    # should_notify sopprimeva la notifica del dominio corto (il prefisso "maremma.it:..."
+    # è contenuto nella riga di stato "parco-maremma.it:...").
+    local sites_dir="$tmp/sites-enabled"
+    local docroot_parco="$tmp/www/parco-maremma.it"
+    local docroot_maremma="$tmp/www/maremma.it"
+    mkdir -p "$sites_dir" "$docroot_parco" "$docroot_maremma"
+
+    cat > "$sites_dir/000-parco-maremma.it.conf" <<EOF
+<VirtualHost *:80>
+    ServerName parco-maremma.it
+    DocumentRoot $docroot_parco
+</VirtualHost>
+EOF
+    cat > "$sites_dir/001-maremma.it.conf" <<EOF
+<VirtualHost *:80>
+    ServerName maremma.it
+    DocumentRoot $docroot_maremma
+</VirtualHost>
+EOF
+
+    # wp-config.php in violazione su entrambi i siti → un'anomalia wp-config per dominio,
+    # distinta e indipendente. Nessun wp-includes/version.php nei docroot: get_wp_version
+    # resta vuoto e main() salta check_index_integrity per la sua guardia
+    # `if [ -n "$wp_version" ]`, quindi nessuna chiamata a api.wordpress.org. Nessuna
+    # uploads/, nessun .htaccess, nessun file con estensione immagine: ioc-files, htaccess e
+    # uploads-php restano puliti per entrambi i siti.
+    local d
+    for d in "$docroot_parco" "$docroot_maremma"; do
+        cat > "$d/wp-config.php" <<'EOF'
+<?php
+define('DISALLOW_FILE_MODS', false);
+define('DISALLOW_FILE_EDIT', false);
+EOF
+    done
+
+    # Regola Apache globale incompleta (manca il path del volume montato): una violazione
+    # sola e globale che, con 2 siti enumerati, deve comunque produrre UNA anomalia e UNA
+    # notifica, non una per sito.
+    cat > "$tmp/no-php-in-writable.conf" <<'EOF'
+<DirectoryMatch "^/var/www/html/[^/]+/(wp-content/uploads|images|\.well-known)/">
+    php_admin_flag engine off
+</DirectoryMatch>
+EOF
+
+    : > "$tmp/exceptions.conf"
+    : > "$tmp/boilerplate.txt"
+
+    local requests_file="$tmp/slack-requests.log"
+    pid=$(start_mock_http_recording_server "$port" 200 "$requests_file")
+    local ready=0
+    wait_for_mock_server "$port" || ready=$?
+    assert_eq "il mock Slack è in ascolto prima di lanciare main()" "0" "$ready"
+
+    printf 'http://127.0.0.1:%s/webhook\n' "$port" > "$tmp/slack-webhook"
+
+    # Tutta la configurazione dello script è in variabili globali: dichiararle `local` qui
+    # le rende visibili a main() (scoping dinamico di bash) e le ripristina all'uscita dal
+    # test, senza toccare nulla fuori dalla sandbox in $tmp.
+    local APACHE_SITES_ENABLED_DIR="$sites_dir"
+    local NO_PHP_CONF="$tmp/no-php-in-writable.conf"
+    local SLACK_WEBHOOK_URL_FILE="$tmp/slack-webhook"
+    local LOG_FILE="$tmp/drift.log"
+    local STATE_FILE="$tmp/state.tsv"
+    local HEARTBEAT_FILE="$tmp/heartbeat"
+    local LOCKFILE="$tmp/drift.lock"
+    local EXCEPTIONS_FILE="$tmp/exceptions.conf"
+    local BOILERPLATE_FILE="$tmp/boilerplate.txt"
+    local STAGGER_SECONDS=0
+    # Schema fittizio: curl rifiuta il protocollo localmente (errore immediato, nessuna
+    # risoluzione DNS né connessione di rete), quindi check_homepage_redirect riceve un body
+    # vuoto ed esce pulito — lo stesso comportamento già previsto e testato per un sito
+    # irraggiungibile. Serve a tenere il test completamente offline senza stubbare la
+    # funzione, così anche il suo cablaggio dentro main() resta sotto test.
+    local HOMEPAGE_SCHEME="wm-test-offline"
+
+    # main() è scritto per girare sotto `set -uo pipefail` come lo script in produzione
+    # (senza -e: diversi check restituiscono non-zero come esito normale). La suite invece
+    # gira con -e, quindi lo eseguiamo in una subshell con `set +e` per riprodurre
+    # fedelmente l'ambiente reale; log, stato e heartbeat restano comunque su disco.
+    local rc=0
+    ( set +e; with_lock "$LOCKFILE" main ) || rc=$?
+    assert_eq "main() completa senza errori (prima run)" "0" "$rc"
+
+    # 1. Il log contiene le tre anomalie distinte. Il match è su stringa fissa comprensiva
+    #    della parentesi quadra aperta, così "[maremma.it]" non matcha "[parco-maremma.it]".
+    local count
+    count=$(grep -cF '[server] apache-rule:' "$LOG_FILE" || true)
+    assert_eq "il log registra l'anomalia apache-rule una sola volta" "1" "$count"
+    count=$(grep -cF '[parco-maremma.it] wp-config:' "$LOG_FILE" || true)
+    assert_eq "il log registra l'anomalia wp-config di parco-maremma.it" "1" "$count"
+    count=$(grep -cF '[maremma.it] wp-config:' "$LOG_FILE" || true)
+    assert_eq "il log registra l'anomalia wp-config di maremma.it" "1" "$count"
+
+    # 2. Lo stato ha tre righe distinte: il dominio suffisso non collide con l'altro.
+    count=$(grep -c . "$STATE_FILE" || true)
+    assert_eq "lo stato contiene esattamente 3 anomalie" "3" "$count"
+    local id
+    for id in "server:apache-rule" "parco-maremma.it:wp-config" "maremma.it:wp-config"; do
+        count=$(awk -F'\t' -v want="$id" '$1 == want' "$STATE_FILE" | grep -c . || true)
+        assert_eq "lo stato ha una riga propria per $id" "1" "$count"
+    done
+
+    # 3. Esattamente 3 POST al webhook: apache-rule una sola volta (non una per sito) e
+    #    wp-config una volta per ciascuno dei due domini (nessuno dei due soppresso).
+    count=$(grep -c . "$requests_file" || true)
+    assert_eq "main() invia esattamente 3 notifiche Slack" "3" "$count"
+
+    # 4. Heartbeat (dead-man's-switch) scritto a fine run.
+    local heartbeat
+    heartbeat=$(cat "$HEARTBEAT_FILE" 2>/dev/null || true)
+    assert_eq "l'heartbeat contiene un timestamp unix plausibile" "ok" \
+        "$(printf '%s' "$heartbeat" | grep -qE '^[0-9]{10,}$' && echo ok || echo "valore inatteso: '$heartbeat'")"
+
+    # 5. Seconda run a fixture invariata: stesse anomalie, stessi conteggi → nessuna nuova
+    #    notifica (si notifica una volta sola finché la situazione non cambia).
+    rc=0
+    ( set +e; with_lock "$LOCKFILE" main ) || rc=$?
+    assert_eq "main() completa senza errori (seconda run)" "0" "$rc"
+    count=$(grep -c . "$requests_file" || true)
+    assert_eq "una seconda run identica non invia nuove notifiche Slack" "3" "$count"
+    count=$(grep -c . "$STATE_FILE" || true)
+    assert_eq "lo stato resta a 3 anomalie dopo la seconda run" "3" "$count"
+
+    stop_mock_server "$pid"
+    rm -rf "$tmp"
+}
+
 test_enumerate_sites_finds_two_distinct_docroots
 test_enumerate_sites_empty_dir_returns_zero
 test_enumerate_sites_multi_space_and_tabs
@@ -819,5 +1007,6 @@ test_with_lock_prevents_concurrent_execution
 test_with_lock_runs_and_releases_when_free
 test_run_check_forwards_stdout_with_nonzero_return
 test_run_check_empty_output_with_zero_return
+test_main_end_to_end_two_sites_suffix_domains
 
 exit $FAIL
