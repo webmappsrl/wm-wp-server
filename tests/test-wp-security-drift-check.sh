@@ -493,6 +493,20 @@ test_check_homepage_redirect_ignores_internal_redirect() {
     rm -rf "$tmp"
 }
 
+test_check_homepage_redirect_ignores_bare_variable_target() {
+    local tmp html_file port pid rc=0 out
+    tmp=$(mktemp -d)
+    html_file="$tmp/index.html"
+    printf '<html><script>location.href = someVariableName;</script></html>' > "$html_file"
+    port=18096
+    pid=$(start_mock_html_server "$port" "$html_file")
+    sleep 2
+    out=$(HOMEPAGE_SCHEME=http check_homepage_redirect "127.0.0.1:$port") || rc=$?
+    assert_eq "non segnala location.href verso una variabile bare (nessuna URL letterale nel match)" "" "$out"
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+
 test_check_homepage_redirect_clean_homepage_no_anomaly() {
     local tmp html_file port pid rc=0 out
     tmp=$(mktemp -d)
@@ -749,6 +763,7 @@ test_check_homepage_redirect_detects_ushort_company_signature
 test_check_homepage_redirect_detects_maintenance_signature
 test_check_homepage_redirect_flags_external_redirect
 test_check_homepage_redirect_ignores_internal_redirect
+test_check_homepage_redirect_ignores_bare_variable_target
 test_check_homepage_redirect_clean_homepage_no_anomaly
 test_check_homepage_redirect_unreachable_site_returns_cleanly
 test_check_homepage_redirect_detects_real_attack_string
