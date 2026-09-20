@@ -261,7 +261,6 @@ main() {
     local domain docroot
     while IFS='|' read -r domain docroot; do
         [ -z "$docroot" ] && continue
-        is_exception "$domain" "$EXCEPTIONS_FILE" && continue
 
         local out
         out=$(run_check "apache-rule" check_apache_protection_enabled "$NO_PHP_CONF")
@@ -271,11 +270,17 @@ main() {
             clear_resolved "$domain:apache-rule" "$STATE_FILE"
         fi
 
-        out=$(run_check "wp-config" check_wp_config_flags "$docroot")
-        if [ -n "$out" ]; then
-            anomaly_domains+=("$domain"); anomaly_checks+=("wp-config"); anomaly_details+=("$out")
-        else
-            clear_resolved "$domain:wp-config" "$STATE_FILE"
+        # L'eccezione DISALLOW (overview.md) è scoped SOLO a questo check: un domain in
+        # $EXCEPTIONS_FILE salta la verifica DISALLOW_FILE_MODS/DISALLOW_FILE_EDIT ma riceve
+        # comunque tutti gli altri controlli di sicurezza (malware, htaccess, uploads, core,
+        # redirect homepage).
+        if ! is_exception "$domain" "$EXCEPTIONS_FILE"; then
+            out=$(run_check "wp-config" check_wp_config_flags "$docroot")
+            if [ -n "$out" ]; then
+                anomaly_domains+=("$domain"); anomaly_checks+=("wp-config"); anomaly_details+=("$out")
+            else
+                clear_resolved "$domain:wp-config" "$STATE_FILE"
+            fi
         fi
 
         out=$(run_check "ioc-files" check_ioc_files "$docroot")
