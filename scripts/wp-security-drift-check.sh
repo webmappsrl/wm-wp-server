@@ -426,13 +426,20 @@ check_homepage_redirect() {
     # dove la destinazione non è mai scritta nella pagina ma decisa altrove (es. redirect
     # post-login alla pagina di provenienza) — un identificatore bare non è questo attacco
     # e non va segnalato né come interno né come esterno: semplicemente non è un finding.
+    #
+    # Due forme di "URL letterale" sono riconosciute:
+    #   1. una virgoletta seguita subito da schema opzionale + "//" — copre
+    #      `location.href = "https://…"` / `location.replace("//…")`;
+    #   2. "url=" (case-insensitive, via grep -i) seguito subito da schema opzionale + "//" —
+    #      copre il formato standard del meta-refresh `content="0;url=https://…"`, dove la
+    #      virgoletta che apre "content" precede "url=" e NON è adiacente allo schema/"//".
     local literal_url_pattern
-    literal_url_pattern='["'\''](https?:)?//'
+    literal_url_pattern='["'\''](https?:)?//|url=(https?:)?//'
 
     local match
     while IFS= read -r match; do
         [ -z "$match" ] && continue
-        grep -qE -- "$literal_url_pattern" <<< "$match" || continue
+        grep -qiE -- "$literal_url_pattern" <<< "$match" || continue
         # Flag solo se il target del redirect NON contiene il dominio del sito stesso
         # (case-insensitive): un redirect interno (stesso dominio) non è un'anomalia.
         if ! grep -qiF -- "$domain" <<< "$match"; then
