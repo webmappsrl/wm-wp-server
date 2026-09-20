@@ -420,9 +420,19 @@ check_homepage_redirect() {
     redirect_pattern+="|location\.href[[:space:]]*=[[:space:]]*[^;]*"
     redirect_pattern+="|<meta[^>]*http-equiv=[\"']?refresh[\"']?[^>]*>"
 
+    # Un redirect va segnalato solo se la destinazione è scritta in chiaro come stringa
+    # letterale (tra virgolette, che inizia con "//", "http://" o "https://") DENTRO al
+    # match. Pattern comune e legittimo in WordPress: `location.href = someVariable;`,
+    # dove la destinazione non è mai scritta nella pagina ma decisa altrove (es. redirect
+    # post-login alla pagina di provenienza) — un identificatore bare non è questo attacco
+    # e non va segnalato né come interno né come esterno: semplicemente non è un finding.
+    local literal_url_pattern
+    literal_url_pattern='["'\''](https?:)?//'
+
     local match
     while IFS= read -r match; do
         [ -z "$match" ] && continue
+        grep -qE -- "$literal_url_pattern" <<< "$match" || continue
         # Flag solo se il target del redirect NON contiene il dominio del sito stesso
         # (case-insensitive): un redirect interno (stesso dominio) non è un'anomalia.
         if ! grep -qiF -- "$domain" <<< "$match"; then
