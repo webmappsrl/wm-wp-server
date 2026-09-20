@@ -570,7 +570,7 @@ test_should_notify_true_for_new_anomaly() {
     tmp=$(mktemp -d)
     state="$tmp/state.tsv"
     local rc=0
-    should_notify "anomaly-1" "$state" || rc=$?
+    should_notify "anomaly-1" "$state" "5" || rc=$?
     assert_eq "notifica sempre una nuova anomalia" "0" "$rc"
     rm -rf "$tmp"
 }
@@ -580,11 +580,40 @@ test_should_notify_only_once_while_anomaly_stays_open() {
     tmp=$(mktemp -d)
     state="$tmp/state.tsv"
     local rc=0
-    should_notify "anomaly-1" "$state" || rc=$?
+    should_notify "anomaly-1" "$state" "5" || rc=$?
     assert_eq "notifica la prima volta" "0" "$rc"
     rc=0
-    should_notify "anomaly-1" "$state" || rc=$?
-    assert_eq "non rinotifica una seconda volta senza clear_resolved, indipendentemente dal tempo trascorso" "1" "$rc"
+    should_notify "anomaly-1" "$state" "5" || rc=$?
+    assert_eq "non rinotifica una seconda volta senza clear_resolved, se il conteggio non cambia" "1" "$rc"
+    rm -rf "$tmp"
+}
+
+test_should_notify_renotifies_when_count_changes() {
+    local tmp state
+    tmp=$(mktemp -d)
+    state="$tmp/state.tsv"
+    local rc=0
+    should_notify "anomaly-1" "$state" "5" || rc=$?
+    assert_eq "notifica la prima volta (count=5)" "0" "$rc"
+    rc=0
+    should_notify "anomaly-1" "$state" "5" || rc=$?
+    assert_eq "non rinotifica con lo stesso conteggio (count=5)" "1" "$rc"
+    rc=0
+    should_notify "anomaly-1" "$state" "8" || rc=$?
+    assert_eq "rinotifica quando il conteggio cambia (count=8), senza clear_resolved" "0" "$rc"
+    rm -rf "$tmp"
+}
+
+test_should_notify_renotifies_when_count_decreases() {
+    local tmp state
+    tmp=$(mktemp -d)
+    state="$tmp/state.tsv"
+    local rc=0
+    should_notify "anomaly-1" "$state" "8" || rc=$?
+    assert_eq "notifica la prima volta (count=8)" "0" "$rc"
+    rc=0
+    should_notify "anomaly-1" "$state" "3" || rc=$?
+    assert_eq "rinotifica anche se il conteggio diminuisce (count=3)" "0" "$rc"
     rm -rf "$tmp"
 }
 
@@ -592,7 +621,7 @@ test_clear_resolved_removes_entry() {
     local tmp state
     tmp=$(mktemp -d)
     state="$tmp/state.tsv"
-    should_notify "anomaly-1" "$state" >/dev/null
+    should_notify "anomaly-1" "$state" "5" >/dev/null
     clear_resolved "anomaly-1" "$state"
     local count
     count=$(grep -c "anomaly-1" "$state" 2>/dev/null || true)
@@ -604,24 +633,26 @@ test_should_notify_true_again_after_clear_resolved() {
     local tmp state
     tmp=$(mktemp -d)
     state="$tmp/state.tsv"
-    should_notify "anomaly-1" "$state" >/dev/null
+    should_notify "anomaly-1" "$state" "5" >/dev/null
     clear_resolved "anomaly-1" "$state"
     local rc=0
-    should_notify "anomaly-1" "$state" || rc=$?
+    should_notify "anomaly-1" "$state" "5" || rc=$?
     assert_eq "rinotifica come nuova occorrenza dopo clear_resolved" "0" "$rc"
     rm -rf "$tmp"
 }
 
 test_should_notify_not_suppressed_by_suffix_domain_entry() {
     # Regression oc:8558: "maremma.it:htaccess" è suffisso di "parco-maremma.it:htaccess".
-    # Con grep -qF (senza -x) la riga esistente per il dominio più lungo faceva match anche
-    # per il dominio più corto/distinto, sopprimendo erroneamente una nuova anomalia.
+    # Con matching per sottostringa la riga esistente per il dominio più lungo farebbe match
+    # anche per il dominio più corto/distinto, sopprimendo erroneamente una nuova anomalia.
+    # Il formato di stato è ora domain:check<TAB><count>, ma il matching deve restare
+    # sul campo esatto (awk -F'\t' '$1 == id'), non per sottostringa.
     local tmp state
     tmp=$(mktemp -d)
     state="$tmp/state.tsv"
-    printf 'parco-maremma.it:htaccess\tnotificata\n' > "$state"
+    printf 'parco-maremma.it:htaccess\t5\n' > "$state"
     local rc=0
-    should_notify "maremma.it:htaccess" "$state" || rc=$?
+    should_notify "maremma.it:htaccess" "$state" "5" || rc=$?
     assert_eq "anomalia di un dominio suffisso non viene soppressa da un'entry di un dominio più lungo" "0" "$rc"
     rm -rf "$tmp"
 }
@@ -629,13 +660,14 @@ test_should_notify_not_suppressed_by_suffix_domain_entry() {
 test_clear_resolved_does_not_remove_longer_domain_entry() {
     # Regression oc:8558: clear_resolved su "maremma.it:htaccess" non deve rimuovere l'entry
     # di "parco-maremma.it:htaccess" (falso match per sottostringa con grep -vF senza -x).
+    # Verificato anche con il nuovo formato basato su conteggio, per lo stesso motivo.
     local tmp state
     tmp=$(mktemp -d)
     state="$tmp/state.tsv"
-    printf 'parco-maremma.it:htaccess\tnotificata\n' > "$state"
+    printf 'parco-maremma.it:htaccess\t5\n' > "$state"
     clear_resolved "maremma.it:htaccess" "$state"
     local rc=0
-    grep -qxF "parco-maremma.it:htaccess"$'\t'"notificata" "$state" || rc=$?
+    grep -qxF "parco-maremma.it:htaccess"$'\t'"5" "$state" || rc=$?
     assert_eq "l'entry del dominio più lungo resta nello stato dopo clear_resolved sul suffisso" "0" "$rc"
     rm -rf "$tmp"
 }
@@ -726,6 +758,8 @@ test_send_slack_alert_returns_failure_on_http_404
 test_send_slack_alert_fails_when_webhook_not_configured
 test_should_notify_true_for_new_anomaly
 test_should_notify_only_once_while_anomaly_stays_open
+test_should_notify_renotifies_when_count_changes
+test_should_notify_renotifies_when_count_decreases
 test_clear_resolved_removes_entry
 test_should_notify_true_again_after_clear_resolved
 test_should_notify_not_suppressed_by_suffix_domain_entry
