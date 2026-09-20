@@ -230,6 +230,8 @@ NO_PHP_CONF="${NO_PHP_CONF:-/etc/apache2/conf-available/no-php-in-writable.conf}
 SLACK_WEBHOOK_URL_FILE="${SLACK_WEBHOOK_URL_FILE:-/root/.wp-security-slack-webhook}"
 # In produzione è sempre https; override consentito solo per i test (mock server locale in http).
 HOMEPAGE_SCHEME="${HOMEPAGE_SCHEME:-https}"
+# Stagger tra un sito e l'altro (secondi) per evitare spike I/O su volumi di rete.
+STAGGER_SECONDS="${STAGGER_SECONDS:-1}"
 
 log() {
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
@@ -333,6 +335,8 @@ main() {
         # Se wp_version non è determinabile, il check non è stato eseguito: non tocchiamo
         # lo stato di index-integrity, perché l'assenza di esecuzione non dice nulla sulla
         # risoluzione di un'anomalia precedente.
+
+        sleep "$STAGGER_SECONDS"
     done <<< "$sites"
 
     local webhook_url=""
