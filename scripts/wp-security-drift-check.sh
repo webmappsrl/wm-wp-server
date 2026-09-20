@@ -258,17 +258,22 @@ main() {
         anomaly_details+=("0 siti trovati — possibile bug nel parsing dei vhost, nessun controllo eseguito")
     fi
 
+    # check_apache_protection_enabled controlla un unico file di configurazione globale
+    # (non per-sito): va eseguito una sola volta per esecuzione dello script, non una volta
+    # per ogni dominio nel loop sotto, altrimenti un'unica violazione genera N anomalie/N
+    # messaggi Slack identici (uno per sito abilitato). Usiamo un domain/anomaly_id fisso e
+    # indipendente dai siti ("server:apache-rule").
+    local out
+    out=$(run_check "apache-rule" check_apache_protection_enabled "$NO_PHP_CONF")
+    if [ -n "$out" ]; then
+        anomaly_domains+=("server"); anomaly_checks+=("apache-rule"); anomaly_details+=("$out")
+    else
+        clear_resolved "server:apache-rule" "$STATE_FILE"
+    fi
+
     local domain docroot
     while IFS='|' read -r domain docroot; do
         [ -z "$docroot" ] && continue
-
-        local out
-        out=$(run_check "apache-rule" check_apache_protection_enabled "$NO_PHP_CONF")
-        if [ -n "$out" ]; then
-            anomaly_domains+=("$domain"); anomaly_checks+=("apache-rule"); anomaly_details+=("$out")
-        else
-            clear_resolved "$domain:apache-rule" "$STATE_FILE"
-        fi
 
         # L'eccezione DISALLOW (overview.md) è scoped SOLO a questo check: un domain in
         # $EXCEPTIONS_FILE salta la verifica DISALLOW_FILE_MODS/DISALLOW_FILE_EDIT ma riceve
