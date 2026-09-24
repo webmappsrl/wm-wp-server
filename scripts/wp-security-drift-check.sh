@@ -12,11 +12,15 @@ enumerate_sites() {
 
     for conf in "$conf_dir"/*.conf; do
         [ -f "$conf" ] || continue
-        # Esclude le righe commentate prima di cercare ServerName: un `# ServerName vecchio`
-        # lasciato sopra a quello reale (es. un nome dismesso, tenuto per storico) non deve
-        # essere letto al posto di quello attivo — trovato concretamente il 24/09/2026 dopo
-        # aver commentato un ServerName legacy (pnfc.webmapp.it) in un vhost reale.
-        domain=$(grep -v '^[[:space:]]*#' "$conf" 2>/dev/null | grep -m1 -oP 'ServerName\s+\K\S+')
+        # Esclude le righe commentate prima di cercare ServerName/DocumentRoot: un `#
+        # ServerName vecchio` o un `# DocumentRoot /vecchio/path` lasciato sopra a quello
+        # reale (es. un nome/path dismesso, tenuto per storico) non deve essere letto al
+        # posto di quello attivo — trovato concretamente il 24/09/2026 dopo aver commentato
+        # un ServerName legacy (pnfc.webmapp.it) in un vhost reale; lo stesso filtro va
+        # applicato anche a DocumentRoot per lo stesso motivo, non solo a ServerName.
+        local conf_active
+        conf_active=$(grep -v '^[[:space:]]*#' "$conf" 2>/dev/null)
+        domain=$(grep -m1 -oP 'ServerName\s+\K\S+' <<< "$conf_active")
         while IFS= read -r root; do
             root=$(echo "$root" | xargs)
             [ -z "$root" ] && continue
@@ -25,7 +29,7 @@ enumerate_sites() {
                 seen_roots[$root]=1
                 echo "${domain:-unknown}|$root"
             fi
-        done < <(grep -oP 'DocumentRoot\s+\K\S+' "$conf" 2>/dev/null)
+        done < <(grep -oP 'DocumentRoot\s+\K\S+' <<< "$conf_active")
     done
 }
 
@@ -113,7 +117,11 @@ check_index_integrity() {
     local docroot="$1"
     local checksums_json="$2"
     local boilerplate_file="$3"
-    local f relpath md5 corehash
+    # baseline_file (opzionale, 4°): elenco di file "noti non-core/non-boilerplate" già
+    # rivisti e accettati manualmente (via --update-baseline). Senza, il comportamento è
+    # identico a prima — ogni valore non-core/non-boilerplate finisce sempre in DA_RIVEDERE.
+    local baseline_file="${4:-}"
+    local f relpath md5 corehash baseline_hash
 
     while IFS= read -r -d '' f; do
         relpath="${f#$docroot/}"
@@ -121,6 +129,8 @@ check_index_integrity() {
 
         corehash=$(echo "$checksums_json" | jq -r --arg p "$relpath" '.checksums[$p] // empty' 2>/dev/null)
         if [ -n "$corehash" ]; then
+            # Un file core WordPress non baseline-abile MAI: un mismatch qui è sempre
+            # un'anomalia da investigare (reinstallare il core), non da "accettare".
             [ "$md5" = "$corehash" ] && continue
             echo "ANOMALIA: $f non combacia col checksum core WordPress ($relpath)"
             continue
@@ -130,7 +140,18 @@ check_index_integrity() {
             continue
         fi
 
-        echo "DA_RIVEDERE: $f non riconosciuto (né core né boilerplate nota)"
+        if [ -n "$baseline_file" ] && [ -f "$baseline_file" ]; then
+            baseline_hash=$(awk -F'\t' -v want="$f" '$1 == want {print $2; exit}' "$baseline_file")
+            if [ -n "$baseline_hash" ]; then
+                if [ "$baseline_hash" = "$md5" ]; then
+                    continue
+                fi
+                echo "ANOMALIA: $f è in baseline con hash diverso (baseline=$baseline_hash, attuale=$md5) — file baselineato modificato"
+                continue
+            fi
+        fi
+
+        echo "DA_RIVEDERE: $f non riconosciuto (né core né boilerplate nota, né in baseline)"
     done < <(find "$docroot" -type f -name "index.php" -print0 2>/dev/null)
 }
 
@@ -149,6 +170,74 @@ baseline_write() {
     local baseline_file="$2"
     mkdir -p "$(dirname "$baseline_file")"
     cp "$candidates_file" "$baseline_file"
+}
+
+# Genera le righe path<TAB>md5 dei soli index.php "unknown" (non-core, non-boilerplate) di
+# un sito — la stessa categoria che check_index_integrity marca DA_RIVEDERE, ma qui SENZA
+# guardare la baseline esistente: --update-baseline deve vedere tutto quello che è
+# genuinamente non-core/non-boilerplate OGGI, baseline vecchia inclusa o no, per poter
+# mostrare il diff completo prima di salvare. I file core con mismatch NON compaiono mai
+# qui: un file core alterato va sempre investigato e risolto manualmente, mai "accettato"
+# in una baseline.
+collect_index_integrity_candidates() {
+    local docroot="$1"
+    local checksums_json="$2"
+    local boilerplate_file="$3"
+    local f relpath md5 corehash
+
+    while IFS= read -r -d '' f; do
+        relpath="${f#$docroot/}"
+        md5=$(md5sum "$f" | cut -d' ' -f1)
+
+        corehash=$(echo "$checksums_json" | jq -r --arg p "$relpath" '.checksums[$p] // empty' 2>/dev/null)
+        if [ -n "$corehash" ]; then
+            continue
+        fi
+
+        if [ -f "$boilerplate_file" ] && grep -qxF "$md5" "$boilerplate_file"; then
+            continue
+        fi
+
+        printf '%s\t%s\n' "$f" "$md5"
+    done < <(find "$docroot" -type f -name "index.php" -print0 2>/dev/null)
+}
+
+# Comando manuale (--update-baseline): raccoglie i candidati su TUTTI i siti, mostra sempre
+# il diff rispetto alla baseline attuale prima di salvare, chiede conferma esplicita — mai
+# un aggiornamento automatico/silenzioso (requisito overview.md).
+run_update_baseline() {
+    local sites domain docroot
+    sites=$(enumerate_sites)
+
+    local tmp_candidates
+    tmp_candidates=$(mktemp)
+
+    while IFS='|' read -r domain docroot; do
+        [ -z "$docroot" ] && continue
+        local wp_version checksums_json
+        wp_version=$(get_wp_version "$docroot")
+        [ -z "$wp_version" ] && continue
+        checksums_json=$(fetch_core_checksums "$wp_version")
+        collect_index_integrity_candidates "$docroot" "$checksums_json" "$BOILERPLATE_FILE" >> "$tmp_candidates"
+    done <<< "$sites"
+
+    sort -o "$tmp_candidates" "$tmp_candidates"
+
+    echo "=== Diff rispetto alla baseline attuale ($BASELINE_FILE) ==="
+    baseline_diff "$tmp_candidates" "$BASELINE_FILE"
+    echo "==="
+    echo -n "Confermi di salvare questa lista come nuova baseline? [y/N] "
+    local risposta
+    read -r risposta
+
+    if [[ "$risposta" =~ ^[Yy]$ ]]; then
+        baseline_write "$tmp_candidates" "$BASELINE_FILE"
+        echo "Baseline aggiornata: $BASELINE_FILE"
+    else
+        echo "Annullato, baseline non modificata."
+    fi
+
+    rm -f "$tmp_candidates"
 }
 
 send_slack_alert() {
@@ -339,7 +428,7 @@ main() {
         wp_version=$(get_wp_version "$docroot")
         if [ -n "$wp_version" ]; then
             checksums_json=$(fetch_core_checksums "$wp_version")
-            out=$(run_check "index-integrity" check_index_integrity "$docroot" "$checksums_json" "$BOILERPLATE_FILE")
+            out=$(run_check "index-integrity" check_index_integrity "$docroot" "$checksums_json" "$BOILERPLATE_FILE" "$BASELINE_FILE")
             if [ -n "$out" ]; then
                 anomaly_domains+=("$domain"); anomaly_checks+=("index-integrity"); anomaly_details+=("$out")
             else
@@ -372,18 +461,30 @@ main() {
         # stesso stato anche se cambia il singolo file nell'elenco delle anomalie rilevate.
         anomaly_id="${anomaly_domain}:${anomaly_check}"
 
-        log "$log_line"
-
-        # Slack riservato ai soli problemi "grossi" (decisione esplicita Giuseppe Bonfanti,
-        # scrum 24/09/2026): redirect verso un dominio esterno o sito irraggiungibile. Tutti
-        # gli altri check (drift protezioni, IOC, index-integrity) restano solo nel log —
-        # consultabile manualmente, ma non generano più notifiche.
-        case "$anomaly_check" in
-            homepage-redirect|site-down) ;;
-            *) continue ;;
-        esac
-
+        # should_notify ora decide anche SE loggare, non solo se mandare Slack (trovato in
+        # review 24/09/2026): prima logavamo il dettaglio completo ad ogni run per ogni
+        # check, a prescindere — per i check che restano solo nel log (tutti tranne
+        # homepage-redirect/site-down/enumerazione-siti, vedi sotto) questo significava lo
+        # stesso identico blocco ripetuto ogni 30 minuti finché il problema non si
+        # risolveva, senza modo di distinguere "stesso problema di ieri" da "problema
+        # nuovo". Applicare qui lo stesso dedup one-shot-finché-aperto già usato per Slack
+        # rende il log l'effettiva rete di sicurezza per quei check, non solo Slack.
         if should_notify "$anomaly_id" "$STATE_FILE" "$anomaly_count"; then
+            log "$log_line"
+
+            # Slack riservato ai soli problemi "grossi" (decisione esplicita Giuseppe
+            # Bonfanti, scrum 24/09/2026): redirect verso un dominio esterno, sito
+            # irraggiungibile, o enumerazione dei siti rotta (0 siti trovati — è la
+            # mitigazione stessa del rischio "falso senso di sicurezza da un'enumerazione
+            # rotta" dichiarata in overview.md, quindi deve arrivare davvero al team, non
+            # solo restare nel log). Tutti gli altri check (drift protezioni, IOC,
+            # index-integrity) restano solo nel log — consultabile manualmente, ma non
+            # generano più notifiche.
+            case "$anomaly_check" in
+                homepage-redirect|site-down|enumerazione-siti) ;;
+                *) continue ;;
+            esac
+
             slack_message="[$anomaly_domain] ${anomaly_check}: ${anomaly_count} anomalie rilevate — vedi log su wordpress-php8:/var/log/wp-security-drift-check.log"
             send_slack_alert "$slack_message" "$webhook_url" || log "invio Slack fallito per: $log_line"
         fi
@@ -515,6 +616,8 @@ check_site_reachable() {
     return 0
 }
 
-if [[ "${1:-}" != "--source-only" ]]; then
-    with_lock "$LOCKFILE" main
-fi
+case "${1:-}" in
+    --source-only) ;;
+    --update-baseline) run_update_baseline ;;
+    *) with_lock "$LOCKFILE" main ;;
+esac

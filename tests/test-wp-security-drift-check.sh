@@ -103,6 +103,25 @@ EOF
     rm -rf "$tmp"
 }
 
+test_enumerate_sites_skips_commented_documentroot() {
+    # Regressione 24/09/2026 (review): il fix sul ServerName commentato copriva solo
+    # ServerName, non DocumentRoot — stesso pattern di bug, stesso identico rischio.
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/sites-enabled"
+    cat > "$tmp/sites-enabled/legacy-root.conf" <<'EOF'
+<VirtualHost *:443>
+    ServerName     sito-vero.it
+    # DocumentRoot   /var/www/html/vecchio-path-dismesso
+    DocumentRoot   /var/www/html/sito-vero.it
+</VirtualHost>
+EOF
+    local out
+    out=$(APACHE_SITES_ENABLED_DIR="$tmp/sites-enabled" enumerate_sites)
+    assert_eq "legge il DocumentRoot attivo, non quello commentato sopra" "sito-vero.it|/var/www/html/sito-vero.it" "$out"
+    rm -rf "$tmp"
+}
+
 test_check_apache_protection_enabled_detects_missing_mount_path() {
     local tmp
     tmp=$(mktemp -d)
@@ -386,6 +405,135 @@ test_check_index_integrity_flags_unrecognized_file() {
     out=$(check_index_integrity "$tmp" "$checksums_json" "/dev/null")
     count=$(echo "$out" | grep -c "DA_RIVEDERE" || true)
     assert_eq "segnala per revisione un file non riconosciuto" "1" "$count"
+    rm -rf "$tmp"
+}
+
+test_check_index_integrity_skips_file_matching_baseline() {
+    local tmp
+    tmp=$(mktemp -d)
+    printf '<?php echo "tema custom, non core, non boilerplate"; ?>' > "$tmp/index.php"
+    local md5 checksums_json baseline out
+    md5=$(md5sum "$tmp/index.php" | cut -d' ' -f1)
+    checksums_json='{"checksums":{}}'
+    baseline="$tmp/baseline.tsv"
+    printf '%s\t%s\n' "$tmp/index.php" "$md5" > "$baseline"
+    out=$(check_index_integrity "$tmp" "$checksums_json" "/dev/null" "$baseline")
+    assert_eq "file in baseline con hash invariato: nessuna anomalia" "" "$out"
+    rm -rf "$tmp"
+}
+
+test_check_index_integrity_flags_baselined_file_changed() {
+    local tmp
+    tmp=$(mktemp -d)
+    printf '<?php echo "contenuto nuovo, diverso da quello baselineato"; ?>' > "$tmp/index.php"
+    local checksums_json baseline out count
+    checksums_json='{"checksums":{}}'
+    baseline="$tmp/baseline.tsv"
+    printf '%s\t%s\n' "$tmp/index.php" "hash-vecchio-diverso" > "$baseline"
+    out=$(check_index_integrity "$tmp" "$checksums_json" "/dev/null" "$baseline")
+    count=$(printf '%s\n' "$out" | grep -c "ANOMALIA.*baseline" || true)
+    assert_eq "file baselineato con hash cambiato: segnalato come anomalia, non ignorato" "1" "$count"
+    rm -rf "$tmp"
+}
+
+test_check_index_integrity_still_flags_unrecognized_without_baseline_arg() {
+    # Retrocompatibilità: senza il 4° argomento, comportamento identico a prima.
+    local tmp
+    tmp=$(mktemp -d)
+    printf '<?php echo "contenuto mai visto prima"; ?>' > "$tmp/index.php"
+    local checksums_json='{"checksums":{}}'
+    local out count
+    out=$(check_index_integrity "$tmp" "$checksums_json" "/dev/null")
+    count=$(printf '%s\n' "$out" | grep -c "DA_RIVEDERE" || true)
+    assert_eq "senza baseline_file: comportamento invariato" "1" "$count"
+    rm -rf "$tmp"
+}
+
+test_collect_index_integrity_candidates_skips_core_and_boilerplate() {
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/wp-admin"
+    printf '<?php // core ?>' > "$tmp/wp-admin/index.php"
+    printf '<?php // stub ?>' > "$tmp/index.php"
+    mkdir -p "$tmp/wp-content/themes/custom"
+    printf '<?php echo "tema custom sconosciuto"; ?>' > "$tmp/wp-content/themes/custom/index.php"
+
+    local core_md5 stub_md5 boilerplate checksums_json out
+    core_md5=$(md5sum "$tmp/wp-admin/index.php" | cut -d' ' -f1)
+    stub_md5=$(md5sum "$tmp/index.php" | cut -d' ' -f1)
+    boilerplate="$tmp/boilerplate.txt"
+    printf '%s\n' "$stub_md5" > "$boilerplate"
+    checksums_json=$(printf '{"checksums":{"wp-admin/index.php":"%s"}}' "$core_md5")
+
+    out=$(collect_index_integrity_candidates "$tmp" "$checksums_json" "$boilerplate")
+    local count
+    count=$(printf '%s\n' "$out" | grep -c . || true)
+    assert_eq "solo il file davvero sconosciuto finisce tra i candidati (core e boilerplate esclusi)" "1" "$count"
+    count=$(printf '%s\n' "$out" | grep -c "wp-content/themes/custom/index.php" || true)
+    assert_eq "il candidato è quello del tema custom" "1" "$count"
+    rm -rf "$tmp"
+}
+
+test_run_update_baseline_confirmed_writes_baseline() {
+    local tmp
+    tmp=$(mktemp -d)
+    local sites_dir="$tmp/sites-enabled"
+    local docroot="$tmp/www/sito.it"
+    mkdir -p "$sites_dir" "$docroot/wp-content/themes/custom"
+    cat > "$sites_dir/sito.conf" <<EOF
+<VirtualHost *:80>
+    ServerName sito.it
+    DocumentRoot $docroot
+</VirtualHost>
+EOF
+    mkdir -p "$docroot/wp-includes"
+    printf "\$wp_version = '6.4';\n" > "$docroot/wp-includes/version.php"
+    printf '<?php echo "tema custom sconosciuto"; ?>' > "$docroot/wp-content/themes/custom/index.php"
+
+    local APACHE_SITES_ENABLED_DIR="$sites_dir"
+    local BOILERPLATE_FILE="$tmp/boilerplate.txt"
+    local BASELINE_FILE="$tmp/baseline.tsv"
+    : > "$BOILERPLATE_FILE"
+
+    # fetch_core_checksums farebbe una vera chiamata di rete: la ridefiniamo SOLO dentro la
+    # subshell di questo $(...) (non tocca la funzione globale vista dagli altri test) così
+    # ogni index.php risulta "non-core" — sufficiente per verificare il flusso di
+    # raccolta+conferma, senza dipendere dalla rete nel test.
+    local out
+    out=$(fetch_core_checksums() { echo '{}'; }; echo "y" | run_update_baseline)
+    assert_eq "il comando stampa conferma di aggiornamento" "1" \
+        "$(printf '%s\n' "$out" | grep -c "Baseline aggiornata" || true)"
+    assert_eq "la baseline viene scritta su disco" "1" \
+        "$(grep -c "wp-content/themes/custom/index.php" "$BASELINE_FILE" || true)"
+    rm -rf "$tmp"
+}
+
+test_run_update_baseline_declined_does_not_write() {
+    local tmp
+    tmp=$(mktemp -d)
+    local sites_dir="$tmp/sites-enabled"
+    local docroot="$tmp/www/sito.it"
+    mkdir -p "$sites_dir" "$docroot/wp-content/themes/custom"
+    cat > "$sites_dir/sito.conf" <<EOF
+<VirtualHost *:80>
+    ServerName sito.it
+    DocumentRoot $docroot
+</VirtualHost>
+EOF
+    mkdir -p "$docroot/wp-includes"
+    printf "\$wp_version = '6.4';\n" > "$docroot/wp-includes/version.php"
+    printf '<?php echo "tema custom sconosciuto"; ?>' > "$docroot/wp-content/themes/custom/index.php"
+
+    local APACHE_SITES_ENABLED_DIR="$sites_dir"
+    local BOILERPLATE_FILE="$tmp/boilerplate.txt"
+    local BASELINE_FILE="$tmp/baseline.tsv"
+    : > "$BOILERPLATE_FILE"
+
+    local out
+    out=$(fetch_core_checksums() { echo '{}'; }; echo "n" | run_update_baseline)
+    assert_eq "il comando stampa l'annullamento" "1" \
+        "$(printf '%s\n' "$out" | grep -c "Annullato" || true)"
+    assert_eq "senza conferma, la baseline NON viene scritta" "" "$([ -f "$BASELINE_FILE" ] && cat "$BASELINE_FILE")"
     rm -rf "$tmp"
 }
 
@@ -914,6 +1062,51 @@ test_run_check_empty_output_with_zero_return() {
     assert_eq "run_check non produce output per check pulito (return 0, no stdout)" "" "$out"
 }
 
+test_main_end_to_end_zero_sites_notifies_slack() {
+    # Regressione 24/09/2026 (review): prima del fix, l'anomalia "enumerazione-siti" (0
+    # siti trovati) non era nel case Slack-eligible — restava solo nel log, silenziando
+    # esattamente il sanity check che overview.md dichiara come mitigazione del rischio
+    # "falso senso di sicurezza da un'enumerazione rotta".
+    local tmp port pid
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/sites-enabled"
+    : > "$tmp/no-php-in-writable.conf"
+    : > "$tmp/exceptions.conf"
+    : > "$tmp/boilerplate.txt"
+    port=18096
+
+    local requests_file="$tmp/slack-requests.log"
+    pid=$(start_mock_http_recording_server "$port" 200 "$requests_file")
+    local ready=0
+    wait_for_mock_server "$port" || ready=$?
+    assert_eq "il mock Slack è in ascolto prima di lanciare main()" "0" "$ready"
+    printf 'http://127.0.0.1:%s/webhook\n' "$port" > "$tmp/slack-webhook"
+
+    local APACHE_SITES_ENABLED_DIR="$tmp/sites-enabled"
+    local NO_PHP_CONF="$tmp/no-php-in-writable.conf"
+    local SLACK_WEBHOOK_URL_FILE="$tmp/slack-webhook"
+    local LOG_FILE="$tmp/drift.log"
+    local STATE_FILE="$tmp/state.tsv"
+    local HEARTBEAT_FILE="$tmp/heartbeat"
+    local LOCKFILE="$tmp/drift.lock"
+    local EXCEPTIONS_FILE="$tmp/exceptions.conf"
+    local BOILERPLATE_FILE="$tmp/boilerplate.txt"
+    local STAGGER_SECONDS=0
+
+    local rc=0
+    ( set +e; with_lock "$LOCKFILE" main ) || rc=$?
+    assert_eq "main() completa senza errori anche con 0 siti" "0" "$rc"
+
+    local count
+    count=$(grep -cF '[enumerazione] enumerazione-siti:' "$LOG_FILE" || true)
+    assert_eq "il log registra l'anomalia enumerazione-siti" "1" "$count"
+    count=$(grep -c . "$requests_file" || true)
+    assert_eq "0 siti trovati invia un alert Slack reale (enumerazione-siti è Slack-eligible)" "1" "$count"
+
+    stop_mock_server "$pid"
+    rm -rf "$tmp"
+}
+
 test_main_end_to_end_two_sites_suffix_domains() {
     # Test di integrazione su main(): è l'unico che esercita l'orchestrazione completa
     # (enumerazione vhost → check per dominio → log → stato → notifiche Slack → heartbeat).
@@ -1034,25 +1227,23 @@ EOF
     count=$(grep -cF '[maremma.it] site-down:' "$LOG_FILE" || true)
     assert_eq "il log registra l'anomalia site-down di maremma.it" "1" "$count"
 
-    # 2. Lo stato traccia SOLO le anomalie Slack-eligible (homepage-redirect/site-down):
-    #    apache-rule e wp-config restano nel log ma non hanno bisogno di stato, perché
-    #    should_notify non viene più chiamato per loro (nessuna decisione di notifica da
-    #    deduplicare). Due righe distinte: il dominio suffisso non collide con l'altro.
+    # 2. Lo stato traccia TUTTE le anomalie (serve al dedup del LOG, non solo di Slack —
+    #    fix 24/09/2026 in risposta alla review: prima apache-rule/wp-config non avevano
+    #    stato perché should_notify non veniva chiamato per loro, e il log si riempiva
+    #    dello stesso dettaglio ogni run). Cinque righe distinte: il dominio suffisso non
+    #    collide con l'altro.
     count=$(grep -c . "$STATE_FILE" || true)
-    assert_eq "lo stato contiene esattamente 2 anomalie (solo site-down)" "2" "$count"
+    assert_eq "lo stato contiene esattamente 5 anomalie (tutte, per il dedup del log)" "5" "$count"
     local id
-    for id in "parco-maremma.it:site-down" "maremma.it:site-down"; do
+    for id in "server:apache-rule" "parco-maremma.it:wp-config" "maremma.it:wp-config" \
+        "parco-maremma.it:site-down" "maremma.it:site-down"; do
         count=$(awk -F'\t' -v want="$id" '$1 == want' "$STATE_FILE" | grep -c . || true)
         assert_eq "lo stato ha una riga propria per $id" "1" "$count"
     done
-    for id in "server:apache-rule" "parco-maremma.it:wp-config" "maremma.it:wp-config"; do
-        count=$(awk -F'\t' -v want="$id" '$1 == want' "$STATE_FILE" | grep -c . || true)
-        assert_eq "lo stato NON traccia $id (non è Slack-eligible)" "0" "$count"
-    done
 
     # 3. Esattamente 2 POST al webhook: solo site-down per ciascuno dei due domini.
-    #    apache-rule/wp-config restano solo nel log, mai su Slack (decisione Giuseppe
-    #    Bonfanti, scrum 24/09/2026).
+    #    apache-rule/wp-config restano solo nel log (deduplicato), mai su Slack (decisione
+    #    Giuseppe Bonfanti, scrum 24/09/2026).
     count=$(grep -c . "$requests_file" || true)
     assert_eq "main() invia esattamente 2 notifiche Slack (solo site-down)" "2" "$count"
 
@@ -1070,7 +1261,14 @@ EOF
     count=$(grep -c . "$requests_file" || true)
     assert_eq "una seconda run identica non invia nuove notifiche Slack" "2" "$count"
     count=$(grep -c . "$STATE_FILE" || true)
-    assert_eq "lo stato resta a 2 anomalie dopo la seconda run" "2" "$count"
+    assert_eq "lo stato resta a 5 anomalie dopo la seconda run" "5" "$count"
+
+    # 6. Verifica esplicita del fix 24/09/2026: la seconda run NON deve raddoppiare le righe
+    #    di log per un'anomalia già nota e invariata (dedup del log via should_notify).
+    count=$(grep -cF '[server] apache-rule:' "$LOG_FILE" || true)
+    assert_eq "seconda run: apache-rule NON riloggato (dedup, stesso conteggio)" "1" "$count"
+    count=$(grep -cF '[parco-maremma.it] wp-config:' "$LOG_FILE" || true)
+    assert_eq "seconda run: wp-config di parco-maremma.it NON riloggato" "1" "$count"
 
     stop_mock_server "$pid"
     rm -rf "$tmp"
@@ -1080,6 +1278,7 @@ test_enumerate_sites_finds_two_distinct_docroots
 test_enumerate_sites_empty_dir_returns_zero
 test_enumerate_sites_multi_space_and_tabs
 test_enumerate_sites_skips_commented_servername
+test_enumerate_sites_skips_commented_documentroot
 test_check_apache_protection_enabled_detects_missing_mount_path
 test_check_apache_protection_enabled_passes_when_both_paths_covered
 test_check_wp_config_flags_detects_violation
@@ -1103,6 +1302,12 @@ test_check_index_integrity_flags_core_mismatch
 test_check_index_integrity_passes_core_match
 test_check_index_integrity_recognizes_boilerplate
 test_check_index_integrity_flags_unrecognized_file
+test_check_index_integrity_skips_file_matching_baseline
+test_check_index_integrity_flags_baselined_file_changed
+test_check_index_integrity_still_flags_unrecognized_without_baseline_arg
+test_collect_index_integrity_candidates_skips_core_and_boilerplate
+test_run_update_baseline_confirmed_writes_baseline
+test_run_update_baseline_declined_does_not_write
 test_baseline_diff_shows_new_files_when_no_baseline_exists
 test_baseline_write_persists_candidates
 test_check_homepage_redirect_detects_ushort_company_signature
@@ -1131,6 +1336,7 @@ test_with_lock_prevents_concurrent_execution
 test_with_lock_runs_and_releases_when_free
 test_run_check_forwards_stdout_with_nonzero_return
 test_run_check_empty_output_with_zero_return
+test_main_end_to_end_zero_sites_notifies_slack
 test_main_end_to_end_two_sites_suffix_domains
 test_check_site_reachable_reachable_site_no_anomaly
 test_check_site_reachable_connection_refused_reports_anomaly
