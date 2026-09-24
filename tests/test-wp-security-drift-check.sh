@@ -83,6 +83,26 @@ EOF
     rm -rf "$tmp"
 }
 
+test_enumerate_sites_skips_commented_servername() {
+    # Regressione 24/09/2026: un vhost reale aveva un ServerName legacy commentato (tenuto per
+    # storico, es. un vecchio nome interno) sopra a quello attivo. grep -m1 senza escludere i
+    # commenti leggeva il nome commentato invece di quello vero.
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/sites-enabled"
+    cat > "$tmp/sites-enabled/legacy.conf" <<'EOF'
+<VirtualHost *:443>
+    # ServerName     nome-legacy-dismesso.it
+    ServerName     sito-vero.it
+    DocumentRoot   /var/www/html/sito-vero.it
+</VirtualHost>
+EOF
+    local out
+    out=$(APACHE_SITES_ENABLED_DIR="$tmp/sites-enabled" enumerate_sites)
+    assert_eq "legge il ServerName attivo, non quello commentato sopra" "sito-vero.it|/var/www/html/sito-vero.it" "$out"
+    rm -rf "$tmp"
+}
+
 test_check_apache_protection_enabled_detects_missing_mount_path() {
     local tmp
     tmp=$(mktemp -d)
@@ -462,6 +482,43 @@ with socketserver.TCPServer(('127.0.0.1', $port), Handler) as httpd:
     echo $!
 }
 
+start_mock_http_get_server() {
+    local port="$1" status_code="$2"
+    python3 -c "
+import http.server, socketserver
+socketserver.TCPServer.allow_reuse_address = True
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response($status_code)
+        self.end_headers()
+    def log_message(self, *args): pass
+with socketserver.TCPServer(('127.0.0.1', $port), Handler) as httpd:
+    httpd.timeout = 10
+    httpd.handle_request()
+" >/dev/null 2>&1 &
+    local pid=$!
+    echo "$pid"
+}
+
+start_mock_slow_http_server() {
+    local port="$1" delay_seconds="$2"
+    python3 -c "
+import http.server, socketserver, time
+socketserver.TCPServer.allow_reuse_address = True
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        time.sleep($delay_seconds)
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args): pass
+with socketserver.TCPServer(('127.0.0.1', $port), Handler) as httpd:
+    httpd.timeout = 30
+    httpd.handle_request()
+" >/dev/null 2>&1 &
+    local pid=$!
+    echo "$pid"
+}
+
 wait_for_mock_server() {
     local port="$1" i
     for i in $(seq 1 100); do
@@ -623,6 +680,53 @@ test_check_homepage_redirect_detects_real_attack_string() {
     assert_eq "la stringa reale dell'attacco viene riconosciuta anche come redirect esterno" "1" "$redirect_count"
     wait "$pid" 2>/dev/null || true
     rm -rf "$tmp"
+}
+
+test_check_site_reachable_reachable_site_no_anomaly() {
+    local tmp html_file port pid rc=0 out
+    tmp=$(mktemp -d)
+    html_file="$tmp/index.html"
+    printf '<html><body>ok</body></html>' > "$html_file"
+    port=18200
+    pid=$(start_mock_html_server "$port" "$html_file")
+    sleep 2
+    out=$(HOMEPAGE_SCHEME=http check_site_reachable "127.0.0.1:$port") || rc=$?
+    assert_eq "sito raggiungibile: nessun errore dello script" "0" "$rc"
+    assert_eq "sito raggiungibile: nessuna anomalia" "" "$out"
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+
+test_check_site_reachable_connection_refused_reports_anomaly() {
+    local rc=0 out count
+    out=$(SITE_REACHABLE_TIMEOUT=2 SITE_REACHABLE_RETRIES=1 SITE_REACHABLE_RETRY_DELAY=0 check_site_reachable "127.0.0.1:1") || rc=$?
+    assert_eq "sito irraggiungibile: nessun errore dello script" "0" "$rc"
+    count=$(printf '%s\n' "$out" | grep -c "non raggiungibile" || true)
+    assert_eq "sito irraggiungibile dopo i retry: anomalia segnalata" "1" "$count"
+}
+
+test_check_site_reachable_5xx_reports_anomaly() {
+    local port pid rc=0 out count
+    port=18201
+    pid=$(start_mock_http_get_server "$port" 500)
+    sleep 2
+    out=$(HOMEPAGE_SCHEME=http SITE_REACHABLE_RETRIES=0 check_site_reachable "127.0.0.1:$port") || rc=$?
+    count=$(printf '%s\n' "$out" | grep -c "non raggiungibile" || true)
+    assert_eq "risposta 500 dal server: anomalia segnalata" "1" "$count"
+    wait "$pid" 2>/dev/null || true
+}
+
+test_check_site_reachable_slow_response_within_timeout_no_anomaly() {
+    # Scenario esplicito richiesto dall'utente: homepage lenta per plugin pesanti, ma che
+    # comunque risponde entro un timeout più largo di quello standard (10s) — non deve
+    # generare un falso positivo di "sito giù".
+    local port pid rc=0 out
+    port=18202
+    pid=$(start_mock_slow_http_server "$port" 3)
+    sleep 2
+    out=$(HOMEPAGE_SCHEME=http SITE_REACHABLE_TIMEOUT=8 SITE_REACHABLE_RETRIES=0 check_site_reachable "127.0.0.1:$port") || rc=$?
+    assert_eq "risposta lenta (3s) ma entro il timeout esteso (8s): nessuna anomalia" "" "$out"
+    wait "$pid" 2>/dev/null || true
 }
 
 test_send_slack_alert_returns_success_on_http_200() {
@@ -899,7 +1003,13 @@ EOF
     # vuoto ed esce pulito — lo stesso comportamento già previsto e testato per un sito
     # irraggiungibile. Serve a tenere il test completamente offline senza stubbare la
     # funzione, così anche il suo cablaggio dentro main() resta sotto test.
+    # Lo stesso schema fittizio fa fallire anche check_site_reachable (curl non riesce a
+    # instaurare alcuna connessione) — ma quel check, a differenza di homepage-redirect,
+    # considera "irraggiungibile" un'anomalia reale (è il suo scopo): per i due domini di
+    # fixture produce quindi correttamente un'anomalia site-down ciascuno, in aggiunta alle
+    # 3 già previste. Retry a zero per non rallentare il test.
     local HOMEPAGE_SCHEME="wm-test-offline"
+    local SITE_REACHABLE_RETRIES=0
 
     # main() è scritto per girare sotto `set -uo pipefail` come lo script in produzione
     # (senza -e: diversi check restituiscono non-zero come esito normale). La suite invece
@@ -909,8 +1019,9 @@ EOF
     ( set +e; with_lock "$LOCKFILE" main ) || rc=$?
     assert_eq "main() completa senza errori (prima run)" "0" "$rc"
 
-    # 1. Il log contiene le tre anomalie distinte. Il match è su stringa fissa comprensiva
-    #    della parentesi quadra aperta, così "[maremma.it]" non matcha "[parco-maremma.it]".
+    # 1. Il log contiene le cinque anomalie distinte (apache-rule + wp-config e site-down per
+    #    ciascuno dei due domini). Il match è su stringa fissa comprensiva della parentesi
+    #    quadra aperta, così "[maremma.it]" non matcha "[parco-maremma.it]".
     local count
     count=$(grep -cF '[server] apache-rule:' "$LOG_FILE" || true)
     assert_eq "il log registra l'anomalia apache-rule una sola volta" "1" "$count"
@@ -918,20 +1029,32 @@ EOF
     assert_eq "il log registra l'anomalia wp-config di parco-maremma.it" "1" "$count"
     count=$(grep -cF '[maremma.it] wp-config:' "$LOG_FILE" || true)
     assert_eq "il log registra l'anomalia wp-config di maremma.it" "1" "$count"
+    count=$(grep -cF '[parco-maremma.it] site-down:' "$LOG_FILE" || true)
+    assert_eq "il log registra l'anomalia site-down di parco-maremma.it" "1" "$count"
+    count=$(grep -cF '[maremma.it] site-down:' "$LOG_FILE" || true)
+    assert_eq "il log registra l'anomalia site-down di maremma.it" "1" "$count"
 
-    # 2. Lo stato ha tre righe distinte: il dominio suffisso non collide con l'altro.
+    # 2. Lo stato traccia SOLO le anomalie Slack-eligible (homepage-redirect/site-down):
+    #    apache-rule e wp-config restano nel log ma non hanno bisogno di stato, perché
+    #    should_notify non viene più chiamato per loro (nessuna decisione di notifica da
+    #    deduplicare). Due righe distinte: il dominio suffisso non collide con l'altro.
     count=$(grep -c . "$STATE_FILE" || true)
-    assert_eq "lo stato contiene esattamente 3 anomalie" "3" "$count"
+    assert_eq "lo stato contiene esattamente 2 anomalie (solo site-down)" "2" "$count"
     local id
-    for id in "server:apache-rule" "parco-maremma.it:wp-config" "maremma.it:wp-config"; do
+    for id in "parco-maremma.it:site-down" "maremma.it:site-down"; do
         count=$(awk -F'\t' -v want="$id" '$1 == want' "$STATE_FILE" | grep -c . || true)
         assert_eq "lo stato ha una riga propria per $id" "1" "$count"
     done
+    for id in "server:apache-rule" "parco-maremma.it:wp-config" "maremma.it:wp-config"; do
+        count=$(awk -F'\t' -v want="$id" '$1 == want' "$STATE_FILE" | grep -c . || true)
+        assert_eq "lo stato NON traccia $id (non è Slack-eligible)" "0" "$count"
+    done
 
-    # 3. Esattamente 3 POST al webhook: apache-rule una sola volta (non una per sito) e
-    #    wp-config una volta per ciascuno dei due domini (nessuno dei due soppresso).
+    # 3. Esattamente 2 POST al webhook: solo site-down per ciascuno dei due domini.
+    #    apache-rule/wp-config restano solo nel log, mai su Slack (decisione Giuseppe
+    #    Bonfanti, scrum 24/09/2026).
     count=$(grep -c . "$requests_file" || true)
-    assert_eq "main() invia esattamente 3 notifiche Slack" "3" "$count"
+    assert_eq "main() invia esattamente 2 notifiche Slack (solo site-down)" "2" "$count"
 
     # 4. Heartbeat (dead-man's-switch) scritto a fine run.
     local heartbeat
@@ -945,9 +1068,9 @@ EOF
     ( set +e; with_lock "$LOCKFILE" main ) || rc=$?
     assert_eq "main() completa senza errori (seconda run)" "0" "$rc"
     count=$(grep -c . "$requests_file" || true)
-    assert_eq "una seconda run identica non invia nuove notifiche Slack" "3" "$count"
+    assert_eq "una seconda run identica non invia nuove notifiche Slack" "2" "$count"
     count=$(grep -c . "$STATE_FILE" || true)
-    assert_eq "lo stato resta a 3 anomalie dopo la seconda run" "3" "$count"
+    assert_eq "lo stato resta a 2 anomalie dopo la seconda run" "2" "$count"
 
     stop_mock_server "$pid"
     rm -rf "$tmp"
@@ -956,6 +1079,7 @@ EOF
 test_enumerate_sites_finds_two_distinct_docroots
 test_enumerate_sites_empty_dir_returns_zero
 test_enumerate_sites_multi_space_and_tabs
+test_enumerate_sites_skips_commented_servername
 test_check_apache_protection_enabled_detects_missing_mount_path
 test_check_apache_protection_enabled_passes_when_both_paths_covered
 test_check_wp_config_flags_detects_violation
@@ -1008,5 +1132,9 @@ test_with_lock_runs_and_releases_when_free
 test_run_check_forwards_stdout_with_nonzero_return
 test_run_check_empty_output_with_zero_return
 test_main_end_to_end_two_sites_suffix_domains
+test_check_site_reachable_reachable_site_no_anomaly
+test_check_site_reachable_connection_refused_reports_anomaly
+test_check_site_reachable_5xx_reports_anomaly
+test_check_site_reachable_slow_response_within_timeout_no_anomaly
 
 exit $FAIL
