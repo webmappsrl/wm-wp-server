@@ -12,7 +12,11 @@ enumerate_sites() {
 
     for conf in "$conf_dir"/*.conf; do
         [ -f "$conf" ] || continue
-        domain=$(grep -m1 -oP 'ServerName\s+\K\S+' "$conf" 2>/dev/null)
+        # Esclude le righe commentate prima di cercare ServerName: un `# ServerName vecchio`
+        # lasciato sopra a quello reale (es. un nome dismesso, tenuto per storico) non deve
+        # essere letto al posto di quello attivo — trovato concretamente il 24/09/2026 dopo
+        # aver commentato un ServerName legacy (pnfc.webmapp.it) in un vhost reale.
+        domain=$(grep -v '^[[:space:]]*#' "$conf" 2>/dev/null | grep -m1 -oP 'ServerName\s+\K\S+')
         while IFS= read -r root; do
             root=$(echo "$root" | xargs)
             [ -z "$root" ] && continue
@@ -320,6 +324,17 @@ main() {
             clear_resolved "$domain:homepage-redirect" "$STATE_FILE"
         fi
 
+        # Check separato da homepage-redirect (richiesta Giuseppe Bonfanti, scrum 24/09/2026):
+        # a differenza di quello, questo E' un uptime check — con timeout/retry più larghi per
+        # tollerare homepage lente per via di plugin pesanti, evitando falsi positivi su siti
+        # che rispondono solo un po' più lentamente del solito.
+        out=$(run_check "site-down" check_site_reachable "$domain")
+        if [ -n "$out" ]; then
+            anomaly_domains+=("$domain"); anomaly_checks+=("site-down"); anomaly_details+=("$out")
+        else
+            clear_resolved "$domain:site-down" "$STATE_FILE"
+        fi
+
         local wp_version checksums_json
         wp_version=$(get_wp_version "$docroot")
         if [ -n "$wp_version" ]; then
@@ -358,6 +373,16 @@ main() {
         anomaly_id="${anomaly_domain}:${anomaly_check}"
 
         log "$log_line"
+
+        # Slack riservato ai soli problemi "grossi" (decisione esplicita Giuseppe Bonfanti,
+        # scrum 24/09/2026): redirect verso un dominio esterno o sito irraggiungibile. Tutti
+        # gli altri check (drift protezioni, IOC, index-integrity) restano solo nel log —
+        # consultabile manualmente, ma non generano più notifiche.
+        case "$anomaly_check" in
+            homepage-redirect|site-down) ;;
+            *) continue ;;
+        esac
+
         if should_notify "$anomaly_id" "$STATE_FILE" "$anomaly_count"; then
             slack_message="[$anomaly_domain] ${anomaly_check}: ${anomaly_count} anomalie rilevate — vedi log su wordpress-php8:/var/log/wp-security-drift-check.log"
             send_slack_alert "$slack_message" "$webhook_url" || log "invio Slack fallito per: $log_line"
@@ -460,6 +485,32 @@ check_homepage_redirect() {
             echo "IOC: homepage di $domain contiene un redirect client-side verso un dominio esterno: $match"
         fi
     done < <(grep -oE "$redirect_pattern" <<< "$html" 2>/dev/null)
+
+    return 0
+}
+
+# Uptime check vero e proprio (a differenza di check_homepage_redirect, che esce pulito su
+# homepage irraggiungibile "perché non è un uptime monitor"). Timeout e retry più larghi
+# dei 10s usati altrove: una homepage con plugin pesanti può legittimamente metterci diversi
+# secondi, e non va confusa con un sito davvero giù. Configurabile via env per i test.
+check_site_reachable() {
+    local domain="$1"
+    local timeout="${SITE_REACHABLE_TIMEOUT:-20}"
+    local retries="${SITE_REACHABLE_RETRIES:-2}"
+    local retry_delay="${SITE_REACHABLE_RETRY_DELAY:-5}"
+    local http_code
+
+    # --retry-all-errors: ritenta anche su timeout/connection-refused, non solo sui codici
+    # HTTP che curl considera transienti di default — un timeout sul primo tentativo (pagina
+    # lenta) non deve da solo produrre un'anomalia.
+    http_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+        -A 'Mozilla/5.0 (compatible; wp-security-drift-check)' \
+        --max-time "$timeout" --retry "$retries" --retry-delay "$retry_delay" --retry-all-errors \
+        "${HOMEPAGE_SCHEME}://${domain}/" 2>/dev/null) || true
+
+    if [ "$http_code" = "000" ] || [[ "$http_code" =~ ^5 ]]; then
+        echo "$domain non raggiungibile (http_code=$http_code dopo $((retries + 1)) tentativi)"
+    fi
 
     return 0
 }
