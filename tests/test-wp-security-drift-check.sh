@@ -602,6 +602,31 @@ with socketserver.TCPServer(('127.0.0.1', $port), Handler) as httpd:
     echo "$pid"
 }
 
+# Variante persistente di start_mock_html_server: dentro main() un dominio riceve DUE fetch
+# reali nello stesso run (check_homepage_redirect e check_site_reachable, entrambe sulla
+# stessa homepage) — un server one-shot verrebbe consumato dalla prima e lascerebbe la
+# seconda a connection-refused, un falso "giù" causato dal test, non dal codice.
+start_mock_html_server_persistent() {
+    local port="$1" content_file="$2"
+    python3 -c "
+import http.server, socketserver
+socketserver.TCPServer.allow_reuse_address = True
+with open('$content_file', 'rb') as f:
+    BODY = f.read()
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(BODY)
+    def log_message(self, *args): pass
+with socketserver.TCPServer(('127.0.0.1', $port), Handler) as httpd:
+    httpd.serve_forever()
+" >/dev/null 2>&1 &
+    local pid=$!
+    echo "$pid"
+}
+
 start_mock_http_recording_server() {
     # Variante di start_mock_http_server che NON serve una sola richiesta: resta in ascolto
     # finché non viene killata e registra ogni POST ricevuta su $requests_file (una riga per
@@ -962,6 +987,54 @@ test_should_notify_renotifies_when_count_decreases() {
     rm -rf "$tmp"
 }
 
+test_is_confirmed_down_false_on_first_occurrence() {
+    local tmp pending rc=0
+    tmp=$(mktemp -d)
+    pending="$tmp/pending.tsv"
+    is_confirmed_down "sito.it:site-down" "$pending" || rc=$?
+    assert_eq "prima occorrenza: non ancora confermato" "1" "$rc"
+    local count
+    count=$(grep -cxF "sito.it:site-down" "$pending" || true)
+    assert_eq "l'anomaly_id viene registrato come pending" "1" "$count"
+    rm -rf "$tmp"
+}
+
+test_is_confirmed_down_true_on_second_occurrence() {
+    local tmp pending rc=0
+    tmp=$(mktemp -d)
+    pending="$tmp/pending.tsv"
+    is_confirmed_down "sito.it:site-down" "$pending" >/dev/null || true
+    rc=0
+    is_confirmed_down "sito.it:site-down" "$pending" || rc=$?
+    assert_eq "seconda occorrenza consecutiva: confermato" "0" "$rc"
+    rm -rf "$tmp"
+}
+
+test_clear_pending_down_resets_confirmation() {
+    local tmp pending rc=0
+    tmp=$(mktemp -d)
+    pending="$tmp/pending.tsv"
+    is_confirmed_down "sito.it:site-down" "$pending" >/dev/null || true
+    clear_pending_down "sito.it:site-down" "$pending"
+    rc=0
+    is_confirmed_down "sito.it:site-down" "$pending" || rc=$?
+    assert_eq "dopo il ripristino (sito tornato su), una nuova occorrenza riparte da zero" "1" "$rc"
+    rm -rf "$tmp"
+}
+
+test_clear_pending_down_does_not_remove_other_entries() {
+    local tmp pending
+    tmp=$(mktemp -d)
+    pending="$tmp/pending.tsv"
+    is_confirmed_down "sito-a.it:site-down" "$pending" >/dev/null || true
+    is_confirmed_down "sito-b.it:site-down" "$pending" >/dev/null || true
+    clear_pending_down "sito-a.it:site-down" "$pending"
+    local count
+    count=$(grep -cxF "sito-b.it:site-down" "$pending" || true)
+    assert_eq "clear_pending_down su un sito non tocca il pending di un altro" "1" "$count"
+    rm -rf "$tmp"
+}
+
 test_clear_resolved_removes_entry() {
     local tmp state
     tmp=$(mktemp -d)
@@ -1060,6 +1133,87 @@ test_run_check_empty_output_with_zero_return() {
     local out
     out=$(run_check "fake-check-clean" fake_check_clean)
     assert_eq "run_check non produce output per check pulito (return 0, no stdout)" "" "$out"
+}
+
+test_main_site_recovers_before_confirmation_never_alerts() {
+    # Scenario esplicito segnalato dall'utente in produzione (24/09/2026): un sito
+    # irraggiungibile al primo controllo ma tornato su da solo prima del giro cron
+    # successivo (blip di rete breve) non deve MAI generare un alert Slack né una riga di
+    # log — is_confirmed_down deve restare "in attesa" e poi risolversi pulito.
+    local tmp site_port slack_port pid
+    tmp=$(mktemp -d)
+    site_port=18222
+    slack_port=18223
+
+    local sites_dir="$tmp/sites-enabled"
+    mkdir -p "$sites_dir" "$tmp/www/sito"
+    # ServerName non deve essere un dominio reale: il nostro parser (grep -oP) accetta
+    # qualunque stringa senza spazi, e qui ci serve un target che possiamo controllare noi
+    # (127.0.0.1:PORTA) per simulare "giù poi di nuovo su" in modo deterministico.
+    cat > "$sites_dir/sito.conf" <<EOF
+<VirtualHost *:80>
+    ServerName 127.0.0.1:$site_port
+    DocumentRoot $tmp/www/sito
+</VirtualHost>
+EOF
+    # Regola Apache completa (entrambi i path attesi): apache-rule non deve generare
+    # un'anomalia in questo test, che isola solo il comportamento di site-down.
+    printf '/var/www/html\n/mnt/HC_Volume_102677298/html\n' > "$tmp/no-php-in-writable.conf"
+    : > "$tmp/exceptions.conf"
+    : > "$tmp/boilerplate.txt"
+
+    local requests_file="$tmp/slack-requests.log"
+    pid=$(start_mock_http_recording_server "$slack_port" 200 "$requests_file")
+    wait_for_mock_server "$slack_port" || true
+    printf 'http://127.0.0.1:%s/webhook\n' "$slack_port" > "$tmp/slack-webhook"
+
+    local APACHE_SITES_ENABLED_DIR="$sites_dir"
+    local NO_PHP_CONF="$tmp/no-php-in-writable.conf"
+    local SLACK_WEBHOOK_URL_FILE="$tmp/slack-webhook"
+    local LOG_FILE="$tmp/drift.log"
+    local STATE_FILE="$tmp/state.tsv"
+    local HEARTBEAT_FILE="$tmp/heartbeat"
+    local LOCKFILE="$tmp/drift.lock"
+    local EXCEPTIONS_FILE="$tmp/exceptions.conf"
+    local BOILERPLATE_FILE="$tmp/boilerplate.txt"
+    local PENDING_DOWN_FILE="$tmp/pending-down.tsv"
+    local STAGGER_SECONDS=0
+    local HOMEPAGE_SCHEME=http
+    local SITE_REACHABLE_RETRIES=0
+    local SITE_REACHABLE_TIMEOUT=2
+
+    # Prima run: nessun listener su $site_port → connection refused → "giù", ma solo pending.
+    local rc=0
+    ( set +e; with_lock "$LOCKFILE" main ) || rc=$?
+    assert_eq "main() completa senza errori (prima run, sito giù)" "0" "$rc"
+    local count
+    count=$(grep -c . "$STATE_FILE" 2>/dev/null || echo 0)
+    assert_eq "prima run: nessuna anomalia confermata nello stato" "0" "$count"
+    count=$(grep -c . "$requests_file" || true)
+    assert_eq "prima run: nessun alert Slack (in attesa di conferma)" "0" "$count"
+
+    # Il sito "si riprende": ora c'è un listener che risponde 200. Persistente (non
+    # one-shot): in questo run il dominio riceve due fetch reali (check_homepage_redirect e
+    # check_site_reachable), un mock one-shot verrebbe consumato dalla prima.
+    local html_file="$tmp/index.html"
+    printf '<html><body>ok</body></html>' > "$html_file"
+    local pid2
+    pid2=$(start_mock_html_server_persistent "$site_port" "$html_file")
+    sleep 2
+
+    rc=0
+    ( set +e; with_lock "$LOCKFILE" main ) || rc=$?
+    assert_eq "main() completa senza errori (seconda run, sito di nuovo su)" "0" "$rc"
+    count=$(grep -c . "$STATE_FILE" 2>/dev/null || echo 0)
+    assert_eq "seconda run: ancora nessuna anomalia (il sito si è ripreso prima della conferma)" "0" "$count"
+    count=$(grep -c . "$requests_file" || true)
+    assert_eq "seconda run: nessun alert Slack mai inviato per il blip" "0" "$count"
+    count=$(grep -c "site-down" "$LOG_FILE" 2>/dev/null || echo 0)
+    assert_eq "nessuna riga di log per site-down: era un blip, non un'anomalia reale" "0" "$count"
+
+    stop_mock_server "$pid2"
+    stop_mock_server "$pid"
+    rm -rf "$tmp"
 }
 
 test_main_end_to_end_zero_sites_notifies_slack() {
@@ -1190,6 +1344,7 @@ EOF
     local LOCKFILE="$tmp/drift.lock"
     local EXCEPTIONS_FILE="$tmp/exceptions.conf"
     local BOILERPLATE_FILE="$tmp/boilerplate.txt"
+    local PENDING_DOWN_FILE="$tmp/pending-down.tsv"
     local STAGGER_SECONDS=0
     # Schema fittizio: curl rifiuta il protocollo localmente (errore immediato, nessuna
     # risoluzione DNS né connessione di rete), quindi check_homepage_redirect riceve un body
@@ -1212,9 +1367,12 @@ EOF
     ( set +e; with_lock "$LOCKFILE" main ) || rc=$?
     assert_eq "main() completa senza errori (prima run)" "0" "$rc"
 
-    # 1. Il log contiene le cinque anomalie distinte (apache-rule + wp-config e site-down per
-    #    ciascuno dei due domini). Il match è su stringa fissa comprensiva della parentesi
-    #    quadra aperta, così "[maremma.it]" non matcha "[parco-maremma.it]".
+    # 1. Prima run: apache-rule + wp-config (per i due domini) sono già anomalie "vere" —
+    #    finiscono subito nel log/stato. site-down invece richiede conferma al giro
+    #    successivo (fix 24/09/2026, produzione: 3 falsi positivi in un giorno, siti tornati
+    #    su da soli — vedi is_confirmed_down): alla prima run resta "in attesa", NESSUN log
+    #    né notifica ancora. Il match è su stringa fissa comprensiva della parentesi quadra
+    #    aperta, così "[maremma.it]" non matcha "[parco-maremma.it]".
     local count
     count=$(grep -cF '[server] apache-rule:' "$LOG_FILE" || true)
     assert_eq "il log registra l'anomalia apache-rule una sola volta" "1" "$count"
@@ -1222,53 +1380,63 @@ EOF
     assert_eq "il log registra l'anomalia wp-config di parco-maremma.it" "1" "$count"
     count=$(grep -cF '[maremma.it] wp-config:' "$LOG_FILE" || true)
     assert_eq "il log registra l'anomalia wp-config di maremma.it" "1" "$count"
-    count=$(grep -cF '[parco-maremma.it] site-down:' "$LOG_FILE" || true)
-    assert_eq "il log registra l'anomalia site-down di parco-maremma.it" "1" "$count"
-    count=$(grep -cF '[maremma.it] site-down:' "$LOG_FILE" || true)
-    assert_eq "il log registra l'anomalia site-down di maremma.it" "1" "$count"
+    count=$(grep -cF 'site-down' "$LOG_FILE" || true)
+    assert_eq "prima run: site-down NON ancora loggato (in attesa di conferma)" "0" "$count"
 
-    # 2. Lo stato traccia TUTTE le anomalie (serve al dedup del LOG, non solo di Slack —
-    #    fix 24/09/2026 in risposta alla review: prima apache-rule/wp-config non avevano
-    #    stato perché should_notify non veniva chiamato per loro, e il log si riempiva
-    #    dello stesso dettaglio ogni run). Cinque righe distinte: il dominio suffisso non
-    #    collide con l'altro.
     count=$(grep -c . "$STATE_FILE" || true)
-    assert_eq "lo stato contiene esattamente 5 anomalie (tutte, per il dedup del log)" "5" "$count"
+    assert_eq "prima run: lo stato contiene solo apache-rule+wp-config (3), site-down è solo pending" "3" "$count"
     local id
-    for id in "server:apache-rule" "parco-maremma.it:wp-config" "maremma.it:wp-config" \
-        "parco-maremma.it:site-down" "maremma.it:site-down"; do
+    for id in "server:apache-rule" "parco-maremma.it:wp-config" "maremma.it:wp-config"; do
         count=$(awk -F'\t' -v want="$id" '$1 == want' "$STATE_FILE" | grep -c . || true)
         assert_eq "lo stato ha una riga propria per $id" "1" "$count"
     done
 
-    # 3. Esattamente 2 POST al webhook: solo site-down per ciascuno dei due domini.
-    #    apache-rule/wp-config restano solo nel log (deduplicato), mai su Slack (decisione
-    #    Giuseppe Bonfanti, scrum 24/09/2026).
+    # 2. Prima run: nessuna notifica Slack ancora (apache-rule/wp-config non sono
+    #    Slack-eligible, site-down è solo pending).
     count=$(grep -c . "$requests_file" || true)
-    assert_eq "main() invia esattamente 2 notifiche Slack (solo site-down)" "2" "$count"
+    assert_eq "prima run: nessuna notifica Slack (site-down in attesa di conferma)" "0" "$count"
 
-    # 4. Heartbeat (dead-man's-switch) scritto a fine run.
+    # 3. Heartbeat (dead-man's-switch) scritto a fine run.
     local heartbeat
     heartbeat=$(cat "$HEARTBEAT_FILE" 2>/dev/null || true)
     assert_eq "l'heartbeat contiene un timestamp unix plausibile" "ok" \
         "$(printf '%s' "$heartbeat" | grep -qE '^[0-9]{10,}$' && echo ok || echo "valore inatteso: '$heartbeat'")"
 
-    # 5. Seconda run a fixture invariata: stesse anomalie, stessi conteggi → nessuna nuova
-    #    notifica (si notifica una volta sola finché la situazione non cambia).
+    # 4. Seconda run, fixture invariata (siti ancora "giù"): site-down è ora CONFERMATO
+    #    (visto anche al giro precedente) → diventa un'anomalia vera, loggata e notificata.
+    #    apache-rule/wp-config restano invariati → dedup, nessuna nuova notifica/rilogga per
+    #    loro (erano già Slack-non-eligible comunque).
     rc=0
     ( set +e; with_lock "$LOCKFILE" main ) || rc=$?
     assert_eq "main() completa senza errori (seconda run)" "0" "$rc"
-    count=$(grep -c . "$requests_file" || true)
-    assert_eq "una seconda run identica non invia nuove notifiche Slack" "2" "$count"
-    count=$(grep -c . "$STATE_FILE" || true)
-    assert_eq "lo stato resta a 5 anomalie dopo la seconda run" "5" "$count"
 
-    # 6. Verifica esplicita del fix 24/09/2026: la seconda run NON deve raddoppiare le righe
-    #    di log per un'anomalia già nota e invariata (dedup del log via should_notify).
+    count=$(grep -cF '[parco-maremma.it] site-down:' "$LOG_FILE" || true)
+    assert_eq "seconda run: site-down di parco-maremma.it ora confermato e loggato" "1" "$count"
+    count=$(grep -cF '[maremma.it] site-down:' "$LOG_FILE" || true)
+    assert_eq "seconda run: site-down di maremma.it ora confermato e loggato" "1" "$count"
     count=$(grep -cF '[server] apache-rule:' "$LOG_FILE" || true)
     assert_eq "seconda run: apache-rule NON riloggato (dedup, stesso conteggio)" "1" "$count"
-    count=$(grep -cF '[parco-maremma.it] wp-config:' "$LOG_FILE" || true)
-    assert_eq "seconda run: wp-config di parco-maremma.it NON riloggato" "1" "$count"
+
+    count=$(grep -c . "$STATE_FILE" || true)
+    assert_eq "seconda run: lo stato ora contiene tutte e 5 le anomalie (site-down confermato)" "5" "$count"
+    for id in "parco-maremma.it:site-down" "maremma.it:site-down"; do
+        count=$(awk -F'\t' -v want="$id" '$1 == want' "$STATE_FILE" | grep -c . || true)
+        assert_eq "lo stato ha una riga propria per $id" "1" "$count"
+    done
+
+    count=$(grep -c . "$requests_file" || true)
+    assert_eq "seconda run: 2 notifiche Slack (site-down confermato per entrambi i domini)" "2" "$count"
+
+    # 5. Terza run, ancora invariata: dedup pieno, nessuna nuova notifica né riga di log.
+    rc=0
+    ( set +e; with_lock "$LOCKFILE" main ) || rc=$?
+    assert_eq "main() completa senza errori (terza run)" "0" "$rc"
+    count=$(grep -c . "$requests_file" || true)
+    assert_eq "terza run: nessuna nuova notifica Slack" "2" "$count"
+    count=$(grep -c . "$STATE_FILE" || true)
+    assert_eq "lo stato resta a 5 anomalie dopo la terza run" "5" "$count"
+    count=$(grep -cF '[parco-maremma.it] site-down:' "$LOG_FILE" || true)
+    assert_eq "terza run: site-down NON riloggato (dedup)" "1" "$count"
 
     stop_mock_server "$pid"
     rm -rf "$tmp"
@@ -1324,6 +1492,10 @@ test_send_slack_alert_returns_success_on_http_200
 test_send_slack_alert_returns_failure_on_http_500
 test_send_slack_alert_returns_failure_on_http_404
 test_send_slack_alert_fails_when_webhook_not_configured
+test_is_confirmed_down_false_on_first_occurrence
+test_is_confirmed_down_true_on_second_occurrence
+test_clear_pending_down_resets_confirmation
+test_clear_pending_down_does_not_remove_other_entries
 test_should_notify_true_for_new_anomaly
 test_should_notify_only_once_while_anomaly_stays_open
 test_should_notify_renotifies_when_count_changes
@@ -1336,6 +1508,7 @@ test_with_lock_prevents_concurrent_execution
 test_with_lock_runs_and_releases_when_free
 test_run_check_forwards_stdout_with_nonzero_return
 test_run_check_empty_output_with_zero_return
+test_main_site_recovers_before_confirmation_never_alerts
 test_main_end_to_end_zero_sites_notifies_slack
 test_main_end_to_end_two_sites_suffix_domains
 test_check_site_reachable_reachable_site_no_anomaly
