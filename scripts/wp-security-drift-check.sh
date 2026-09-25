@@ -521,12 +521,24 @@ main() {
             # solo restare nel log). Tutti gli altri check (drift protezioni, IOC,
             # index-integrity) restano solo nel log — consultabile manualmente, ma non
             # generano più notifiche.
+            # Messaggio (fix 25/09/2026, richiesta esplicita Giuseppe Bonfanti, scrum): via
+            # il concetto di "anomalia"/conteggio e il path del log — "rumore" inutile, va
+            # comunque aperto il server per leggerlo. Solo sito + cosa è successo, secco. In
+            # inglese su richiesta esplicita dell'utente (i messaggi Slack restano in
+            # inglese, il resto della documentazione/log in italiano).
             case "$anomaly_check" in
-                homepage-redirect|site-down|enumerazione-siti) ;;
+                site-down)
+                    slack_message="[$anomaly_domain] site-down"
+                    ;;
+                homepage-redirect)
+                    slack_message="[$anomaly_domain] suspicious redirect detected on homepage."
+                    ;;
+                enumerazione-siti)
+                    slack_message="Site enumeration: 0 sites found on server wordpress-php8 — check skipped."
+                    ;;
                 *) continue ;;
             esac
 
-            slack_message="[$anomaly_domain] ${anomaly_check}: ${anomaly_count} anomalie rilevate — vedi log su wordpress-php8:/var/log/wp-security-drift-check.log"
             send_slack_alert "$slack_message" "$webhook_url" || log "invio Slack fallito per: $log_line"
         fi
     done
