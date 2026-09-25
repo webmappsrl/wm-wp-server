@@ -1135,6 +1135,70 @@ test_run_check_empty_output_with_zero_return() {
     assert_eq "run_check non produce output per check pulito (return 0, no stdout)" "" "$out"
 }
 
+test_main_homepage_redirect_message_format() {
+    # Verifica end-to-end (con invio Slack reale verso il mock) del formato messaggio
+    # richiesto da Giuseppe Bonfanti il 25/09/2026: "[sito] cosa è successo", niente
+    # "anomalie rilevate" né path del log.
+    local tmp site_port slack_port pid pid2
+    tmp=$(mktemp -d)
+    site_port=18224
+    slack_port=18225
+
+    local sites_dir="$tmp/sites-enabled"
+    mkdir -p "$sites_dir" "$tmp/www/sito"
+    cat > "$sites_dir/sito.conf" <<EOF
+<VirtualHost *:80>
+    ServerName 127.0.0.1:$site_port
+    DocumentRoot $tmp/www/sito
+</VirtualHost>
+EOF
+    printf '/var/www/html\n/mnt/HC_Volume_102677298/html\n' > "$tmp/no-php-in-writable.conf"
+    : > "$tmp/exceptions.conf"
+    : > "$tmp/boilerplate.txt"
+
+    local html_file="$tmp/index.html"
+    printf '<html><script>location.replace("//dominio-esterno-malevolo.evil/x");</script></html>' > "$html_file"
+    pid2=$(start_mock_html_server_persistent "$site_port" "$html_file")
+
+    local requests_file="$tmp/slack-requests.log"
+    pid=$(start_mock_http_recording_server "$slack_port" 200 "$requests_file")
+    wait_for_mock_server "$slack_port" || true
+    printf 'http://127.0.0.1:%s/webhook\n' "$slack_port" > "$tmp/slack-webhook"
+
+    local APACHE_SITES_ENABLED_DIR="$sites_dir"
+    local NO_PHP_CONF="$tmp/no-php-in-writable.conf"
+    local SLACK_WEBHOOK_URL_FILE="$tmp/slack-webhook"
+    local LOG_FILE="$tmp/drift.log"
+    local STATE_FILE="$tmp/state.tsv"
+    local HEARTBEAT_FILE="$tmp/heartbeat"
+    local LOCKFILE="$tmp/drift.lock"
+    local EXCEPTIONS_FILE="$tmp/exceptions.conf"
+    local BOILERPLATE_FILE="$tmp/boilerplate.txt"
+    local PENDING_DOWN_FILE="$tmp/pending-down.tsv"
+    local STAGGER_SECONDS=0
+    local HOMEPAGE_SCHEME=http
+    local SITE_REACHABLE_RETRIES=0
+    local SITE_REACHABLE_TIMEOUT=2
+    sleep 2
+
+    local rc=0
+    ( set +e; with_lock "$LOCKFILE" main ) || rc=$?
+    assert_eq "main() completa senza errori" "0" "$rc"
+
+    local body count
+    body=$(cat "$requests_file")
+    count=$(printf '%s' "$body" | grep -cF '[127.0.0.1:'"$site_port"'] suspicious redirect detected on homepage.' || true)
+    assert_eq "il messaggio homepage-redirect è 'sito + cosa è successo'" "1" "$count"
+    assert_eq "il messaggio non contiene 'anomalie rilevate'" "" \
+        "$(printf '%s' "$body" | grep -o 'anomalie rilevate' || true)"
+    assert_eq "il messaggio non contiene il path del log" "" \
+        "$(printf '%s' "$body" | grep -o 'wp-security-drift-check.log' || true)"
+
+    stop_mock_server "$pid2"
+    stop_mock_server "$pid"
+    rm -rf "$tmp"
+}
+
 test_main_site_recovers_before_confirmation_never_alerts() {
     # Scenario esplicito segnalato dall'utente in produzione (24/09/2026): un sito
     # irraggiungibile al primo controllo ma tornato su da solo prima del giro cron
@@ -1256,6 +1320,17 @@ test_main_end_to_end_zero_sites_notifies_slack() {
     assert_eq "il log registra l'anomalia enumerazione-siti" "1" "$count"
     count=$(grep -c . "$requests_file" || true)
     assert_eq "0 siti trovati invia un alert Slack reale (enumerazione-siti è Slack-eligible)" "1" "$count"
+
+    # Formato messaggio (fix 25/09/2026, richiesta Giuseppe Bonfanti): niente "anomalie
+    # rilevate" né path del log.
+    local body
+    body=$(cat "$requests_file")
+    assert_eq "il messaggio non contiene 'anomalie rilevate'" "" \
+        "$(printf '%s' "$body" | grep -o 'anomalie rilevate' || true)"
+    assert_eq "il messaggio non contiene il path del log" "" \
+        "$(printf '%s' "$body" | grep -o 'wp-security-drift-check.log' || true)"
+    count=$(printf '%s' "$body" | grep -cF 'Site enumeration: 0 sites found' || true)
+    assert_eq "il messaggio dice sito/contesto + cosa è successo" "1" "$count"
 
     stop_mock_server "$pid"
     rm -rf "$tmp"
@@ -1427,6 +1502,17 @@ EOF
     count=$(grep -c . "$requests_file" || true)
     assert_eq "seconda run: 2 notifiche Slack (site-down confermato per entrambi i domini)" "2" "$count"
 
+    # Formato messaggio (fix 25/09/2026, richiesta Giuseppe Bonfanti): "[sito] site-down",
+    # niente "anomalie rilevate" né path del log.
+    local body
+    body=$(cat "$requests_file")
+    count=$(printf '%s' "$body" | grep -cF '[parco-maremma.it] site-down' || true)
+    assert_eq "il messaggio è '[dominio] site-down', secco" "1" "$count"
+    assert_eq "il messaggio non contiene 'anomalie rilevate'" "" \
+        "$(printf '%s' "$body" | grep -o 'anomalie rilevate' || true)"
+    assert_eq "il messaggio non contiene il path del log" "" \
+        "$(printf '%s' "$body" | grep -o 'wp-security-drift-check.log' || true)"
+
     # 5. Terza run, ancora invariata: dedup pieno, nessuna nuova notifica né riga di log.
     rc=0
     ( set +e; with_lock "$LOCKFILE" main ) || rc=$?
@@ -1508,6 +1594,7 @@ test_with_lock_prevents_concurrent_execution
 test_with_lock_runs_and_releases_when_free
 test_run_check_forwards_stdout_with_nonzero_return
 test_run_check_empty_output_with_zero_return
+test_main_homepage_redirect_message_format
 test_main_site_recovers_before_confirmation_never_alerts
 test_main_end_to_end_zero_sites_notifies_slack
 test_main_end_to_end_two_sites_suffix_domains
