@@ -299,6 +299,40 @@ clear_resolved() {
     mv "$tmp_state" "$state_file"
 }
 
+# Conferma-al-giro-successivo per site-down (trovato in produzione il 24/09/2026: 3 falsi
+# positivi in un giorno, siti tornati su da soli entro il giro successivo — probabili blip di
+# rete brevi, non siti realmente giù). Un sito irraggiungibile viene registrato ma NON ancora
+# notificato/loggato alla prima rilevazione; solo se risulta ancora irraggiungibile al giro
+# cron successivo (~30 min dopo, oltre al timeout/retry già interni a check_site_reachable)
+# viene trattato come anomalia reale. Se nel frattempo si riprende, il marker viene ripulito e
+# non arriva mai nessun alert per quel blip.
+is_confirmed_down() {
+    local anomaly_id="$1"
+    local pending_file="$2"
+
+    mkdir -p "$(dirname "$pending_file")" 2>/dev/null || true
+    touch "$pending_file"
+
+    if grep -qxF "$anomaly_id" "$pending_file"; then
+        # Già visto irraggiungibile al giro precedente: confermato.
+        return 0
+    fi
+
+    # Prima volta che risulta giù: registriamo e aspettiamo conferma al prossimo giro.
+    echo "$anomaly_id" >> "$pending_file"
+    return 1
+}
+
+clear_pending_down() {
+    local anomaly_id="$1"
+    local pending_file="$2"
+    [ -f "$pending_file" ] || return 0
+    local tmp_pending
+    tmp_pending=$(mktemp)
+    grep -vxF "$anomaly_id" "$pending_file" > "$tmp_pending" || true
+    mv "$tmp_pending" "$pending_file"
+}
+
 with_lock() {
     local lockfile="$1"; shift
     local fn="$1"; shift
@@ -316,6 +350,7 @@ LOCKFILE="${LOCKFILE:-/tmp/wp-security-drift-check.lock}"
 LOG_FILE="${LOG_FILE:-/var/log/wp-security-drift-check.log}"
 STATE_FILE="${STATE_FILE:-/root/state/wp-security-drift-state.tsv}"
 BASELINE_FILE="${BASELINE_FILE:-/root/state/wp-security-index-baseline.tsv}"
+PENDING_DOWN_FILE="${PENDING_DOWN_FILE:-/root/state/wp-security-drift-pending-down.tsv}"
 HEARTBEAT_FILE="${HEARTBEAT_FILE:-/root/state/wp-security-drift-heartbeat}"
 EXCEPTIONS_FILE="${EXCEPTIONS_FILE:-/root/config/disallow-exceptions.conf}"
 BOILERPLATE_FILE="${BOILERPLATE_FILE:-/root/config/index-boilerplate-whitelist.txt}"
@@ -419,8 +454,14 @@ main() {
         # che rispondono solo un po' più lentamente del solito.
         out=$(run_check "site-down" check_site_reachable "$domain")
         if [ -n "$out" ]; then
-            anomaly_domains+=("$domain"); anomaly_checks+=("site-down"); anomaly_details+=("$out")
+            # Non trattiamo subito come anomalia: serve conferma al giro cron successivo
+            # (vedi is_confirmed_down) per non allarmare su un blip di rete breve che si
+            # risolve da solo prima del prossimo controllo.
+            if is_confirmed_down "$domain:site-down" "$PENDING_DOWN_FILE"; then
+                anomaly_domains+=("$domain"); anomaly_checks+=("site-down"); anomaly_details+=("$out")
+            fi
         else
+            clear_pending_down "$domain:site-down" "$PENDING_DOWN_FILE"
             clear_resolved "$domain:site-down" "$STATE_FILE"
         fi
 
