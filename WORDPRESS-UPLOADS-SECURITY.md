@@ -295,6 +295,27 @@ Eseguita una ricerca sull'intero filesystem (`/`, esclusi solo `/proc` `/sys` `/
 
 **Non ancora fatto:** rimozione/quarantena dei 2175 file (bassa priorità, sono inerti); decisione su ricostruzione server; eventuale rotazione credenziali; capire il vettore d'ingresso iniziale.
 
+### Nuovo ritrovamento (2026-10-01): attività malware datata 21/09, non 15/09 — timeline da rivedere
+
+Durante un'operazione non collegata (disattivazione del `git pull` da `/root/docs`, vedi sotto), trovato un secondo repository git a livello di **`/root`** (non `/root/docs`), con **"No commits yet"** — scheletro di un `git init` mai arrivato a un commit.
+
+**Dentro `/root/.git` erano presenti 4 file `index.html`** (`branches/`, `hooks/`, `info/`, e la radice del repo) con **lo stesso identico payload malware** già noto (falsa pagina "Briefly unavailable for scheduled maintenance" + redirect mobile a `ushort.company/pxCXpSDmu0r6` — stesso path esatto già visto su `/usr/share/python3/bcep/index.html`, vedi sopra).
+
+**Timestamp: 2026-09-21 06:15:53 UTC**, identico al millisecondo su tutti i file del repo — compresi quelli standard generati automaticamente da `git init` (`hooks/*.sample`, `config`, `HEAD`, `description`). Questo indica che la creazione del repository e la scrittura del payload sono avvenute nella **stessa azione/esecuzione**, non in due momenti separati.
+
+**Significato:** questa è una data **successiva** a tutte le evidenze precedenti (attacco originale 9/9, modifica del file in `/usr/share` il 15/9) — e **successiva** alla chiusura di oc:8511/oc:8515 come "Rilasciato". Sposta in avanti la finestra temporale nota dell'incidente.
+
+**Indagine eseguita sul meccanismo (esito: non determinato):**
+- `auth.log` 21/09 06:00–06:20 UTC: nessuna sessione SSH autenticata con successo, solo rumore di bot con tentativi falliti/non autenticati (`preauth`) — nessuna corrispondenza con l'orario esatto.
+- Unica sessione cron di root nella stessa finestra (06:15:01) è il nostro `wp-security-drift-deadman.sh`, schedulato in buona fede — non scrive `index.html` né esegue `git init`, e lo scarto di 52 secondi non lo rende una spiegazione plausibile.
+- `atq` e `/var/spool/cron/atjobs/` (meccanismo di persistenza spesso trascurato): vuoti, nessun job pendente o residuo.
+- Nessun'altra voce in `/var/log/syslog` riconducibile a quell'istante.
+- **Verifica che non sia un problema ancora attivo oggi**: ricerca di nuovi file `index.html` creati dopo il 21/09 su tutto il filesystem — **nessun nuovo file malevolo trovato** (solo asset legittimi di Cursor Server, `.cursor-server/.../media/index.html`, estranei al malware). Nessun segnale di un processo ancora in esecuzione in questo momento.
+
+**Conclusione:** il meccanismo con cui questa scrittura root è avvenuta il 21/09 **resta non determinato** (stesso esito già avuto per il vettore d'ingresso del 9/9) — ma è confermato che non è un'attività in corso oggi. Trattato come evidenza, non cancellato: spostato in quarantena in `/root/backups/backdoor-quarantine/root-git-sep21/<timestamp>/`.
+
+**Impatto sulla raccomandazione già fatta:** rafforza, non introduce, la raccomandazione di ricostruzione del server — un accesso root confermato una settimana dopo la "chiusura" dell'incidente è coerente con l'ipotesi che la causa radice non fosse stata rimossa, non con un evento isolato e concluso il 9/9.
+
 ### Fix collaterale: log Apache del volume montato mai ruotati
 
 Durante l'indagine scoperto che i log dei 4 siti su `/mnt/HC_Volume_102677298/logs/` (european-mountaineers.eu, outcropedia.org, selfguided-toscana.it, sicai.webmapp.it — più i due inattivi euma.webmapp.it e outcropedia.tectask.org) **non erano mai stati ruotati**: fino a **1.4 GB** (selfguided-toscana.it), 534 MB, 268 MB, 145 MB. A differenza del gruppo `/var/www/html`, non avevano nessuna voce in `/etc/logrotate.d/`. Rischio concreto di saturazione disco nel tempo.
