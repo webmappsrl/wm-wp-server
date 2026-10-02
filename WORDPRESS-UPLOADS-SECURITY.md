@@ -397,3 +397,32 @@ Nessuno dei due è toccato da `/root/cleanup_logs.sh` (cron notturno, root, sogl
 `/mnt/HC_Volume_102677298/html/selfguided-toscana.it/wp-content/debug.log` — 40 MB, ma **fermo dal 3 giugno 2025** (nessuna scrittura successiva): non è un log in crescita, solo spazio occupato da un file ormai inerte.
 
 **Deciso il 2026-10-01: nessuna azione per ora.** Nessuna entry logrotate aggiunta per `curl-monitor.log` / `le-renew.log`, nessuna pulizia del `debug.log` dormiente. Punti aperti per un intervento futuro, se richiesto.
+
+---
+
+## Follow-up 2026-10-02 — rumore email Wordfence "User locked out" (credential-stuffing distribuito)
+
+**Contesto:** segnalate email Wordfence "User locked out from signing in" ricevute **a raffica** (es. 26 email in 16 secondi). Analizzate 207 email su 30 thread (4/9 → 2/10) via Gmail: concentrate soprattutto su `parco-maremma.it` (20 thread su 30, burst anche da 22 e 41 email), sporadiche su trekking, acquasorgente, selfguided-toscana, european-mountaineers.
+
+**Natura del fenomeno:** analizzato il dettaglio di un burst (26 tentativi): **26 IP sorgente quasi tutti diversi** (range tipici di VPS/hosting abusati: `45.3.x.x`, `65.111.x.x`, `104.207.x.x`, `209.50.x.x`, `216.26.x.x` — Ashburn VA, Toronto, Berlino, Parigi), username casuali/dizionario (`site_admin`, `wplogin`, `zetgifari`, …). È un **botnet di credential-stuffing distribuito** generico, non mirato a questi siti specifici — fenomeno comune su qualunque installazione WordPress esposta, **non collegato** alle backdoor/IOC `ushort.company` documentate sopra.
+
+**Perché fail2ban non è la soluzione qui:** a differenza dello scan "Gravity SMTP" (sezione sopra, un bot persistente da pochi IP → fail2ban efficace), un ban per-IP non scatta mai contro questo pattern: ogni IP tenta una volta sola e sparisce, sotto qualunque soglia ragionevole di `maxretry`.
+
+**Verifica:** su tutte le 207 email controllate, **nessun accesso riuscito** — Wordfence sta già bloccando correttamente ogni tentativo (lockout 5 minuti). Le email non segnalano un fallimento della protezione, solo il volume del rumore di fondo.
+
+### Fix applicato: tetto email/ora su Wordfence (non un blocco di rete)
+
+Opzioni Wordfence lette/modificate via `wp db query` sulla tabella `wp_wfconfig` (non `wp_options` — Wordfence 9.x usa una tabella dedicata) di ciascun sito:
+
+| Opzione | Prima | Dopo |
+|---|---|---|
+| `alertOn_throttle` | `0` (nessun limite) | `1` |
+| `alert_maxHourly` | `0` | `5` |
+
+Applicato su tutti gli **8 siti con Wordfence attivo** (verificato `wp plugin is-active wordfence` prima di procedere): parco-maremma, parcopan, sentierodeiducati, trekking, acquasorgente, european-mountaineers, outcropedia, selfguided-toscana. (`sicai.webmapp.it` non ha Wordfence attivo.)
+
+`alertOn_loginLockout` (il flag che genera l'alert per ogni lockout) **lasciato invariato** — su parcopan e sentierodeiducati era già `0` da prima (nessuna email di questo tipo mai arrivata da questi due, coerente con l'assenza nei 30 thread controllati); sugli altri 6 resta `1`. La protezione reale (Wordfence che blocca il tentativo) non è stata toccata in nessun sito — solo il volume delle notifiche.
+
+**Verifica post-modifica:** tutti e 8 i siti rispondono HTTP 200 dopo l'intervento, nessun down.
+
+**Non ancora fatto:** nessuna azione sui range IP sorgente (valutata e scartata per ora, rischio falsi positivi su traffico legittimo); nessuna modifica a `alertOn_loginLockout`.
