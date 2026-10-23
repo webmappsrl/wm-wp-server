@@ -13,7 +13,7 @@
 # decine di migliaia di file piccoli lo riempirebbero (circa 10 GB per sito invece di 0,5).
 # L'archivio conserva i permessi, che l'exFAT perde, ma non i proprietari: rsync gira come
 # utente del Mac. In un ripristino sul server servono chown e chmod come da
-# WORDPRESS-CORE-PLUGIN-UPDATES.md (owner root, gruppo www-data sulle cartelle scrivibili).
+# documentazione operativa del repo privato (owner root, gruppo www-data sulle cartelle scrivibili).
 # STAGING_DIR deve stare su un file system case-sensitive se un sito ha nomi che differiscono
 # solo per maiuscole (sicai: src/Views e src/views); vedi docker/php-compat/README.md.
 set -euo pipefail
