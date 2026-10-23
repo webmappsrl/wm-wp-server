@@ -1,0 +1,35 @@
+# Filtro rsync "senza media" — oc:8834
+# Uso: rsync -a --filter="merge scripts/php-migration/rsync-no-media.filter" <docroot>/ <dest>/
+# Esclude le cartelle anno in testa a uploads e, ovunque sotto uploads, i file media.
+# Tutto il resto (CSS, JS, font, JSON, cache, codice) si copia. rsync non ha match
+# case-insensitive: le estensioni sono scritte con classi di caratteri.
+- /wp-content/uploads/[0-9][0-9][0-9][0-9]/
+- /wp-content/uploads/**.[jJ][pP][gG]
+- /wp-content/uploads/**.[jJ][pP][eE][gG]
+- /wp-content/uploads/**.[pP][nN][gG]
+- /wp-content/uploads/**.[gG][iI][fF]
+- /wp-content/uploads/**.[wW][eE][bB][pP]
+- /wp-content/uploads/**.[aA][vV][iI][fF]
+- /wp-content/uploads/**.[sS][vV][gG]
+- /wp-content/uploads/**.[bB][mM][pP]
+- /wp-content/uploads/**.[tT][iI][fF]
+- /wp-content/uploads/**.[tT][iI][fF][fF]
+- /wp-content/uploads/**.[iI][cC][oO]
+- /wp-content/uploads/**.[hH][eE][iI][cC]
+- /wp-content/uploads/**.[mM][pP]4
+- /wp-content/uploads/**.[mM][oO][vV]
+- /wp-content/uploads/**.[wW][eE][bB][mM]
+- /wp-content/uploads/**.[aA][vV][iI]
+- /wp-content/uploads/**.[mM][kK][vV]
+- /wp-content/uploads/**.[mM]4[vV]
+- /wp-content/uploads/**.[mM][pP]3
+- /wp-content/uploads/**.[wW][aA][vV]
+- /wp-content/uploads/**.[oO][gG][gG]
+- /wp-content/uploads/**.[mM]4[aA]
+- /wp-content/uploads/**.[pP][dD][fF]
+- /wp-content/uploads/**.[zZ][iI][pP]
+- /wp-content/uploads/**.[gG][zZ]
+- /wp-content/uploads/**.[tT][gG][zZ]
+- /wp-content/uploads/**.[rR][aA][rR]
+- /wp-content/uploads/**.7[zZ]
+- /wp-content/uploads/**.[pP][sS][dD]

@@ -1,0 +1,7 @@
+// Aggiornamenti automatici anche dal PPA ondrej/php — oc:8834
+// Il PPA fornisce PHP 8.4 e le librerie da cui dipende. La 8.1 resta sui pacchetti Ubuntu
+// grazie al pin in /etc/apt/preferences.d/php81-ubuntu, che vale anche qui.
+// Package-Whitelist non si usa: è globale e fermerebbe anche gli aggiornamenti Ubuntu.
+Unattended-Upgrade::Origins-Pattern {
+        "origin=LP-PPA-ondrej-php,codename=${distro_codename}";
+};

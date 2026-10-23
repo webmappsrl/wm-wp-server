@@ -1,0 +1,59 @@
+# Ambiente di test di compatibilità PHP — oc:8834
+# Uso: PHP_VERSION=8.4.27 SITE_NAME=<sito> SITE_ROOT=<docroot di produzione> SITE_WORK=<copia di lavoro>
+#      docker compose -f docker/php-compat/compose.yml up -d --build --wait
+# web e db stanno solo sulla rete "isolated" (internal: nessun accesso a internet). La porta
+# 8443 sul Mac la pubblica "edge", un inoltro TCP che sta anche sulla rete esterna: è l'unico
+# container con un'uscita, e non esegue codice dei siti.
+services:
+  web:
+    build:
+      context: .
+      args:
+        PHP_VERSION: ${PHP_VERSION:-8.4.27}
+    image: oc8834-php-compat:${PHP_VERSION:-8.4.27}
+    environment:
+      SITE_NAME: ${SITE_NAME:?SITE_NAME mancante}
+      SITE_ROOT: ${SITE_ROOT:?SITE_ROOT mancante}
+    volumes:
+      - ${SITE_WORK:?SITE_WORK mancante}:${SITE_ROOT}
+      - ./logs:/var/log/php
+    networks: [isolated]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/443"]
+      interval: 2s
+      retries: 30
+
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: oc8834
+      MYSQL_USER: wp
+      MYSQL_PASSWORD: oc8834
+    volumes:
+      - db:/var/lib/mysql
+    networks: [isolated]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-poc8834"]
+      interval: 2s
+      retries: 60
+
+  edge:
+    image: alpine/socat:1.8.0.0
+    command: TCP-LISTEN:443,fork,reuseaddr TCP:web:443
+    ports:
+      - "127.0.0.1:8443:443"
+    networks: [isolated, outside]
+    depends_on:
+      web:
+        condition: service_healthy
+
+networks:
+  isolated:
+    internal: true
+  outside: {}
+
+volumes:
+  db: {}
